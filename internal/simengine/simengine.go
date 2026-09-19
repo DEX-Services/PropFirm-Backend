@@ -77,6 +77,9 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		if err != nil {
 			return nil, err
 		}
+		if err := chargeSpotNotional(ctx, e.accounts, account.ID, in.Market, price, in.Size); err != nil {
+			return nil, err
+		}
 		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String())
 	case "limit", "stop_loss", "take_profit":
 		if in.TriggerPrice == nil {
@@ -110,12 +113,35 @@ func chargeEntryFee(ctx context.Context, accounts *repo.AccountRepo, accountID, 
 	return fee, nil
 }
 
-// ClosePosition realizes PnL on an open trade at the current price — the
-// plan's "banking" step — then charges the real exit taker fee (section
-// 11), netted out of the realized PnL actually credited to the account.
-// Balance/equity update for the PnL itself happens via the account's next
-// Tick(), not here, to keep a single source of truth for account math; the
-// fee is debited immediately since it's a real cost, not PnL.
+// chargeSpotNotional debits the full cash cost of a SPOT buy from the
+// account's balance immediately — spot is cash, not margin (section 12):
+// buying an asset means that cash is no longer available, not just a PnL
+// delta to be banked later. FUTURES positions are margin-based and never
+// move the full notional, only PnL and fees, so this is a no-op for them.
+func chargeSpotNotional(ctx context.Context, accounts *repo.AccountRepo, accountID string, market models.Market, priceStr string, size decimal.Decimal) error {
+	if market != models.MarketSpot {
+		return nil
+	}
+	price, err := decimal.NewFromString(priceStr)
+	if err != nil {
+		return fmt.Errorf("parse fill price: %w", err)
+	}
+	notional := price.Mul(size)
+	if notional.IsPositive() {
+		if err := accounts.DebitBalance(ctx, accountID, notional); err != nil {
+			return fmt.Errorf("charge spot notional: %w", err)
+		}
+	}
+	return nil
+}
+
+// ClosePosition realizes a trade at the current price then charges the real
+// exit taker fee (section 11). For FUTURES (margin-based), the realized PnL
+// is banked into balance via the account's next Tick(), same as before. For
+// SPOT (cash-based, section 12), the original purchase cost was already
+// debited from balance at open time (chargeSpotNotional above), so closing
+// must credit back the full sale proceeds directly — crediting only the
+// PnL delta here would leave the original notional permanently missing.
 func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	trade, err := e.trades.Get(ctx, tradeID)
 	if err != nil {
@@ -145,6 +171,15 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	if exitFee.IsPositive() {
 		if err := e.accounts.DebitBalance(ctx, trade.AccountID, exitFee); err != nil {
 			return fmt.Errorf("charge exit fee: %w", err)
+		}
+	}
+
+	if trade.Market == models.MarketSpot {
+		proceeds := closePrice.Mul(size)
+		if proceeds.IsPositive() {
+			if err := e.accounts.CreditBalance(ctx, trade.AccountID, proceeds); err != nil {
+				return fmt.Errorf("credit spot proceeds: %w", err)
+			}
 		}
 	}
 
@@ -360,6 +395,9 @@ func (e *Engine) fillPendingOrders(ctx context.Context, account *models.Account)
 			}
 			fee, err := chargeEntryFee(ctx, e.accounts, account.ID, price, size, string(t.Market))
 			if err != nil {
+				return err
+			}
+			if err := chargeSpotNotional(ctx, e.accounts, account.ID, t.Market, price, size); err != nil {
 				return err
 			}
 			if err := e.trades.Fill(ctx, t.ID, price, fee.String()); err != nil {

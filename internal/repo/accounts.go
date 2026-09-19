@@ -135,6 +135,19 @@ func (r *AccountRepo) DebitBalance(ctx context.Context, id string, amount decima
 	return err
 }
 
+// CreditBalance adds amount (e.g. spot sale proceeds) back to an account's
+// balance and equity — the mirror of DebitBalance, used when a SPOT
+// position closes and the cash originally spent to buy the asset comes
+// back plus/minus its price move (section 11/12: spot is cash, not margin).
+func (r *AccountRepo) CreditBalance(ctx context.Context, id string, amount decimal.Decimal) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE public.pf_accounts
+		SET balance_bi2xusd = balance_bi2xusd + $2, equity_bi2xusd = equity_bi2xusd + $2, updated_at = $3
+		WHERE id = $1
+	`, id, amount, time.Now())
+	return err
+}
+
 // SetStatus flips an account's status — used for breach detection
 // (-> "breached"), phase-pass (-> "passed"), and going live (-> "funded").
 func (r *AccountRepo) SetStatus(ctx context.Context, id string, status models.AccountStatus) error {
