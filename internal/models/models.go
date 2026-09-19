@@ -153,6 +153,8 @@ type Trade struct {
 	Leverage       int        `json:"leverage"` // always 1 for spot
 	ClosePrice     *string    `json:"closePrice,omitempty"`
 	RealizedPnl    *string    `json:"realizedPnl,omitempty"`
+	EntryFee       string     `json:"entryFee"` // real exchange taker fee, PROP_FIRM_PLAN.md section 11 — charged on fill, not an estimate
+	ExitFee        *string    `json:"exitFee,omitempty"`
 	OrderType      string     `json:"orderType"` // "market" | "limit" | "stop_loss" | "take_profit"
 	TriggerPrice   *string    `json:"triggerPrice,omitempty"` // set for limit/SL/TP, nil once filled/market
 	Status         string     `json:"status"`                 // "pending" | "open" | "closed" | "cancelled"

@@ -4,8 +4,13 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/dex/propfirm-backend/internal/priceclient"
+	"github.com/dex/propfirm-backend/internal/simengine"
 )
+
+var decimalHundred = decimal.NewFromInt(100)
 
 type MarketsHandler struct {
 	prices *priceclient.Client
@@ -31,6 +36,12 @@ type marketRow struct {
 	Price         string `json:"price,omitempty"`
 	Change24hPct  string `json:"change24hPct,omitempty"`
 	HasPrice      bool   `json:"hasPrice"`
+	// TakerFeePct is PropFirm's own real, undiscounted taker fee rate for
+	// this market (PROP_FIRM_PLAN.md section 11) — expressed as a percent
+	// (e.g. "0.45" for spot, "0.045" for futures), matching what simengine
+	// actually charges, not the exchange's own per-symbol/discount-adjusted
+	// rate which could differ from what a PropFirm account is charged.
+	TakerFeePct string `json:"takerFeePct"`
 }
 
 // List handles GET /markets — proxies the matching-engine's real
@@ -59,6 +70,7 @@ func (h *MarketsHandler) List(w http.ResponseWriter, r *http.Request) {
 			BaseCurrency:  m.BaseCurrency,
 			QuoteCurrency: m.QuoteCurrency,
 			MaxLeverage:   m.MaxLeverage,
+			TakerFeePct:   simengine.FeeRateFor(m.Market).Mul(decimalHundred).String(),
 		}
 		wg.Add(1)
 		go func(idx int, sym, mkt string) {

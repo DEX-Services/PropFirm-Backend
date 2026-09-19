@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 
 	"github.com/dex/propfirm-backend/internal/models"
 )
@@ -118,6 +119,19 @@ func (r *AccountRepo) UpdateEquity(ctx context.Context, id, balance, equity, hig
 			updated_at = $5
 		WHERE id = $1
 	`, id, balance, equity, highWaterMark, time.Now())
+	return err
+}
+
+// DebitBalance subtracts amount (e.g. a trading fee) from an account's
+// balance and equity — a real cost applied immediately, independent of any
+// trade's own PnL, matching PROP_FIRM_PLAN.md section 11: PropFirm trades
+// pay the exchange's real, undiscounted fees on every trade.
+func (r *AccountRepo) DebitBalance(ctx context.Context, id string, amount decimal.Decimal) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE public.pf_accounts
+		SET balance_bi2xusd = balance_bi2xusd - $2, equity_bi2xusd = equity_bi2xusd - $2, updated_at = $3
+		WHERE id = $1
+	`, id, amount, time.Now())
 	return err
 }
 

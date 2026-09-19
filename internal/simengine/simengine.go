@@ -73,23 +73,49 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		if err != nil {
 			return nil, fmt.Errorf("fetch price: %w", err)
 		}
-		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open")
+		fee, err := chargeEntryFee(ctx, e.accounts, account.ID, price, in.Size, string(in.Market))
+		if err != nil {
+			return nil, err
+		}
+		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String())
 	case "limit", "stop_loss", "take_profit":
 		if in.TriggerPrice == nil {
 			return nil, fmt.Errorf("%s order requires a trigger price", in.OrderType)
 		}
 		trigger := in.TriggerPrice.String()
-		// entryPrice is set once filled; store 0 as a placeholder until then.
-		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), "0", in.Leverage, in.OrderType, &trigger, "pending")
+		// entryPrice/entryFee are set once filled (see fillPendingOrders) —
+		// no fee is charged for merely placing a pending order, only on the
+		// actual fill, same as a real exchange.
+		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), "0", in.Leverage, in.OrderType, &trigger, "pending", "0")
 	default:
 		return nil, fmt.Errorf("unknown order type %q", in.OrderType)
 	}
 }
 
+// chargeEntryFee computes the real taker fee (PROP_FIRM_PLAN.md section 11
+// — no discount) on a fill's notional and debits it from the account
+// immediately, independent of the trade's own future PnL.
+func chargeEntryFee(ctx context.Context, accounts *repo.AccountRepo, accountID, priceStr string, size decimal.Decimal, market string) (decimal.Decimal, error) {
+	price, err := decimal.NewFromString(priceStr)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("parse fill price: %w", err)
+	}
+	notional := price.Mul(size)
+	fee := notional.Mul(FeeRateFor(market))
+	if fee.IsPositive() {
+		if err := accounts.DebitBalance(ctx, accountID, fee); err != nil {
+			return decimal.Zero, fmt.Errorf("charge entry fee: %w", err)
+		}
+	}
+	return fee, nil
+}
+
 // ClosePosition realizes PnL on an open trade at the current price — the
-// plan's "banking" step. Balance/equity update happens via the account's
-// next Tick(), not here, to keep a single source of truth for account
-// math.
+// plan's "banking" step — then charges the real exit taker fee (section
+// 11), netted out of the realized PnL actually credited to the account.
+// Balance/equity update for the PnL itself happens via the account's next
+// Tick(), not here, to keep a single source of truth for account math; the
+// fee is debited immediately since it's a real cost, not PnL.
 func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	trade, err := e.trades.Get(ctx, tradeID)
 	if err != nil {
@@ -106,7 +132,23 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	if err != nil {
 		return err
 	}
-	return e.trades.Close(ctx, tradeID, price, pnl.String())
+
+	closePrice, err := decimal.NewFromString(price)
+	if err != nil {
+		return fmt.Errorf("parse close price: %w", err)
+	}
+	size, err := decimal.NewFromString(trade.Size)
+	if err != nil {
+		return fmt.Errorf("parse trade size: %w", err)
+	}
+	exitFee := closePrice.Mul(size).Mul(FeeRateFor(string(trade.Market)))
+	if exitFee.IsPositive() {
+		if err := e.accounts.DebitBalance(ctx, trade.AccountID, exitFee); err != nil {
+			return fmt.Errorf("charge exit fee: %w", err)
+		}
+	}
+
+	return e.trades.Close(ctx, tradeID, price, pnl.String(), exitFee.String())
 }
 
 // CancelOrder drops a still-pending limit/stop-loss/take-profit order.
@@ -312,7 +354,15 @@ func (e *Engine) fillPendingOrders(ctx context.Context, account *models.Account)
 			continue
 		}
 		if triggerReached(t, current, trigger) {
-			if err := e.trades.Fill(ctx, t.ID, price); err != nil {
+			size, err := decimal.NewFromString(t.Size)
+			if err != nil {
+				continue
+			}
+			fee, err := chargeEntryFee(ctx, e.accounts, account.ID, price, size, string(t.Market))
+			if err != nil {
+				return err
+			}
+			if err := e.trades.Fill(ctx, t.ID, price, fee.String()); err != nil {
 				return err
 			}
 			if err := e.accounts.RecordTradingDay(ctx, account.ID, time.Now()); err != nil {

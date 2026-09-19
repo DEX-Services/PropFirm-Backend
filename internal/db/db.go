@@ -40,6 +40,7 @@ type migration struct {
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	migrations := []migration{
 		{"core schema", ensureCoreSchema},
+		{"pf_trades fee columns", ensureTradeFeeColumns},
 	}
 	for _, m := range migrations {
 		if err := m.run(ctx, pool); err != nil {
@@ -132,6 +133,8 @@ CREATE TABLE IF NOT EXISTS public.pf_trades (
 	leverage       INTEGER NOT NULL DEFAULT 1,
 	close_price    NUMERIC,
 	realized_pnl   NUMERIC,
+	entry_fee      NUMERIC NOT NULL DEFAULT 0,
+	exit_fee       NUMERIC,
 	order_type     TEXT NOT NULL CHECK (order_type IN ('market','limit','stop_loss','take_profit')),
 	trigger_price  NUMERIC,
 	status         TEXT NOT NULL CHECK (status IN ('pending','open','closed','cancelled')),
@@ -155,6 +158,20 @@ CREATE TABLE IF NOT EXISTS public.pf_profit_credits (
 	credited_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_pf_profit_credits_account ON public.pf_profit_credits(account_id);
+`)
+	return err
+}
+
+// ensureTradeFeeColumns adds entry_fee/exit_fee to pf_trades for databases
+// created before real fee charging was wired in (PROP_FIRM_PLAN.md section
+// 11) — CREATE TABLE IF NOT EXISTS in ensureCoreSchema above only creates
+// the table on a fresh database, it never adds columns to one that already
+// exists, so this runs as its own idempotent ALTER TABLE step, same
+// pattern as Dex-Backend/internal/db/db.go's own column-add migrations.
+func ensureTradeFeeColumns(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS entry_fee NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS exit_fee NUMERIC;
 `)
 	return err
 }
