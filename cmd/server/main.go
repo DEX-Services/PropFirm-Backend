@@ -80,6 +80,8 @@ func main() {
 	internalSecret := mustEnv("PROPFIRM_INTERNAL_SECRET")
 
 	packagesHandler := api.NewPackagesHandler(packagesRepo)
+	marketsHandler := api.NewMarketsHandler(priceClient)
+	depthHandler := api.NewDepthHandler(priceClient)
 	provisionHandler := api.NewProvisionHandler(purchasesRepo, packagesRepo, usersRepo, accountsRepo, newID)
 	authHandler := api.NewAuthHandler(usersRepo, tokenIssuer)
 	accountsHandler := api.NewAccountsHandler(accountsRepo)
@@ -93,6 +95,19 @@ func main() {
 
 	// Public — the exchange's purchase page reads this directly.
 	mux.HandleFunc("/packages", packagesHandler.List)
+
+	// Public — BitDX Prop Firm's own trade screen reads the real, currently
+	// registered market list + live prices through here (never calls the
+	// exchange's matching-engine directly from the browser).
+	mux.HandleFunc("/markets", marketsHandler.List)
+
+	// Public — real order-book depth and recent trades from the exchange's
+	// own matching-engine, proxied for reference display on the trade
+	// screen. Simulated (evaluation-stage) orders never execute against
+	// this book — it's shown for market context only (see PROP_FIRM_PLAN.md
+	// section 10).
+	mux.HandleFunc("/depth", depthHandler.Depth)
+	mux.HandleFunc("/trades", depthHandler.Trades)
 
 	// Server-to-server only — Dex-Backend calls this after a successful
 	// BI2XUSD debit (PROP_FIRM_PLAN.md section 3/13).

@@ -32,35 +32,48 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// tickerResponse matches matching-engine's TickerResponse shape (see
-// matching-engine/cmd/engine/ticker.go / dto.go) — only the field this
-// client needs. MarkPrice is used, not BestBid/BestAsk/MidPrice, since
-// it's the engine's own definition of "the current price" for a symbol,
-// including its futures index/funding logic where applicable.
-type tickerResponse struct {
-	MarkPrice string `json:"markPrice"`
+// TickerResponse mirrors the fields of matching-engine's own
+// TickerResponse (cmd/engine/dto.go) that BitDX Prop Firm needs — real
+// mark price plus real 24h change/volume, not fabricated ones.
+type TickerResponse struct {
+	Symbol       string `json:"symbol"`
+	Market       string `json:"market"`
+	MarkPrice    string `json:"markPrice"`
+	Change24hPct string `json:"change24hPct,omitempty"`
+	Volume24h    string `json:"volume24h,omitempty"`
+	Has24hData   bool   `json:"has24hData,omitempty"`
 }
 
-// Price returns the current mark price for (symbol, market) as a decimal
-// string, e.g. Price("BTC-BI2XUSD", "FUTURES").
-func (c *Client) Price(symbol, market string) (string, error) {
+// Ticker fetches the full ticker (price + 24h stats) for (symbol, market).
+func (c *Client) Ticker(symbol, market string) (*TickerResponse, error) {
 	url := fmt.Sprintf("%s/ticker?symbol=%s&market=%s", c.baseURL, symbol, market)
 	resp, err := c.http.Get(url)
 	if err != nil {
-		return "", fmt.Errorf("fetch ticker: %w", err)
+		return nil, fmt.Errorf("fetch ticker: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ticker %s/%s: unexpected status %d", symbol, market, resp.StatusCode)
+		return nil, fmt.Errorf("ticker %s/%s: unexpected status %d", symbol, market, resp.StatusCode)
 	}
 
-	var t tickerResponse
+	var t TickerResponse
 	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return "", fmt.Errorf("decode ticker: %w", err)
+		return nil, fmt.Errorf("decode ticker: %w", err)
 	}
 	if t.MarkPrice == "" {
-		return "", fmt.Errorf("ticker %s/%s: empty markPrice", symbol, market)
+		return nil, fmt.Errorf("ticker %s/%s: empty markPrice", symbol, market)
+	}
+	return &t, nil
+}
+
+// Price returns just the current mark price for (symbol, market) as a
+// decimal string — used by the simulated trading engine, which only needs
+// the price, not the full ticker.
+func (c *Client) Price(symbol, market string) (string, error) {
+	t, err := c.Ticker(symbol, market)
+	if err != nil {
+		return "", err
 	}
 	return t.MarkPrice, nil
 }
