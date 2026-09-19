@@ -1,0 +1,15 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Go
+/bin/
+/dist/
+*.log
+
+# OS
+.DS_Store
