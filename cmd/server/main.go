@@ -109,8 +109,11 @@ func main() {
 	mux.HandleFunc("/trading/positions", api.RequireAuth(tokenIssuer, tradingHandler.Positions))
 	mux.HandleFunc("/trading/history", api.RequireAuth(tokenIssuer, tradingHandler.History))
 
+	frontendOrigin := envOr("PROPFIRM_FRONTEND_ORIGIN", "http://localhost:3001")
+	handler := api.CORS(frontendOrigin, mux)
+
 	addr := ":" + envOr("PORT", "8090")
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: handler}
 
 	go func() {
 		log.Printf("BitDX Prop Firm backend listening on %s", addr)
