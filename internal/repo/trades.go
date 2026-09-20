@@ -25,14 +25,22 @@ func scanTrade(row interface {
 	Scan(dest ...interface{}) error
 }) (*models.Trade, error) {
 	var t models.Trade
-	err := row.Scan(
-		&t.ID, &t.AccountID, &t.Symbol, &t.Market, &t.Side, &t.Size, &t.EntryPrice, &t.Leverage, &t.ClosePrice, &t.RealizedPnl,
-		&t.EntryFee, &t.ExitFee, &t.OrderType, &t.TriggerPrice, &t.Status, &t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
-	)
-	if err != nil {
+	if err := scanTradeInto(row, &t); err != nil {
 		return nil, err
 	}
 	return &t, nil
+}
+
+// scanTradeInto scans one pf_trades row into an existing Trade. Split out
+// from scanTrade so the multi-result-set reader below can reuse the exact
+// same column order without duplicating the dest list.
+func scanTradeInto(row interface {
+	Scan(dest ...interface{}) error
+}, t *models.Trade) error {
+	return row.Scan(
+		&t.ID, &t.AccountID, &t.Symbol, &t.Market, &t.Side, &t.Size, &t.EntryPrice, &t.Leverage, &t.ClosePrice, &t.RealizedPnl,
+		&t.EntryFee, &t.ExitFee, &t.OrderType, &t.TriggerPrice, &t.Status, &t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
+	)
 }
 
 // Open creates a filled (market) or pending (limit/stop/take-profit)
@@ -150,4 +158,74 @@ func (r *TradeRepo) Close(ctx context.Context, id, closePrice, realizedPnl, exit
 func (r *TradeRepo) Cancel(ctx context.Context, id string) error {
 	_, err := r.pool.Exec(ctx, `UPDATE public.pf_trades SET status = 'cancelled', closed_at = $2 WHERE id = $1`, id, time.Now())
 	return err
+}
+
+// PositionsAndHistoryFor returns open positions, pending orders, and recent
+// closed/cancelled history for one account in a single network round-trip.
+//
+// This exists because GET /trading/positions + GET /trading/history are the
+// frontend's 5-second poll, and each was a separate statement. Against the
+// remote database this service currently talks to (~119ms RTT) every extra
+// statement is ~119ms of pure latency on a loop that runs forever.
+//
+// The three statements are bundled with pgx.Batch, which keeps them as three
+// ordinary queries (so the multi-result-set handling of pgx v5's Rows is not
+// needed) while paying the round-trip cost only once. The statuses and
+// ordering are exactly those of OpenPositionsFor/PendingOrdersFor/History,
+// so the returned rows are identical to calling those three separately.
+func (r *TradeRepo) PositionsAndHistoryFor(ctx context.Context, accountID string, historyLimit int) (open, pending, history []models.Trade, err error) {
+	batch := &pgx.Batch{}
+	batch.Queue(`
+		SELECT `+tradeColumns+`
+		FROM public.pf_trades WHERE account_id = $1 AND status = 'open'
+		ORDER BY created_at
+	`, accountID)
+	batch.Queue(`
+		SELECT `+tradeColumns+`
+		FROM public.pf_trades WHERE account_id = $1 AND status = 'pending'
+		ORDER BY created_at
+	`, accountID)
+	batch.Queue(`
+		SELECT `+tradeColumns+`
+		FROM public.pf_trades
+		WHERE account_id = $1 AND status IN ('closed','cancelled')
+		ORDER BY closed_at DESC NULLS LAST, created_at DESC
+		LIMIT $2
+	`, accountID, historyLimit)
+
+	results := r.pool.SendBatch(ctx, batch)
+	defer func() {
+		if closeErr := results.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+
+	collect := func() ([]models.Trade, error) {
+		rows, qErr := results.Query()
+		if qErr != nil {
+			return nil, qErr
+		}
+		defer rows.Close()
+
+		var out []models.Trade
+		for rows.Next() {
+			var t models.Trade
+			if scanErr := scanTradeInto(rows, &t); scanErr != nil {
+				return nil, scanErr
+			}
+			out = append(out, t)
+		}
+		return out, rows.Err()
+	}
+
+	if open, err = collect(); err != nil {
+		return nil, nil, nil, err
+	}
+	if pending, err = collect(); err != nil {
+		return nil, nil, nil, err
+	}
+	if history, err = collect(); err != nil {
+		return nil, nil, nil, err
+	}
+	return open, pending, history, nil
 }

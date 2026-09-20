@@ -41,20 +41,30 @@ func (h *PackagesHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One query for every package's phases instead of one query per
+	// package. The catalog is ~15 packages, so the previous per-package
+	// PhasesFor loop cost 16 sequential round-trips to the database — on
+	// the remote instance this endpoint talks to that was ~1.9s of pure
+	// latency, on the first-paint path of the trade and profile pages.
+	ids := make([]string, len(pkgs))
+	for i, p := range pkgs {
+		ids[i] = p.ID
+	}
+	phasesByPackage, err := h.packages.PhasesForMany(ctx, ids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load phases")
+		return
+	}
+
 	out := make([]packageWithPhases, 0, len(pkgs))
 	for _, p := range pkgs {
-		phases, err := h.packages.PhasesFor(ctx, p.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load phases")
-			return
-		}
 		out = append(out, packageWithPhases{
 			ID:                 p.ID,
 			Track:              string(p.Track),
 			AccountSizeBI2XUSD: p.AccountSizeBI2XUSD,
 			PriceBI2XUSD:       p.PriceBI2XUSD,
 			LeverageMaxFutures: p.LeverageMaxFutures,
-			Phases:             phases,
+			Phases:             phasesByPackage[p.ID],
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

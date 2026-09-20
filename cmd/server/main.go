@@ -123,6 +123,10 @@ func main() {
 	mux.HandleFunc("/trading/cancel", api.RequireAuth(tokenIssuer, tradingHandler.CancelOrder))
 	mux.HandleFunc("/trading/positions", api.RequireAuth(tokenIssuer, tradingHandler.Positions))
 	mux.HandleFunc("/trading/history", api.RequireAuth(tokenIssuer, tradingHandler.History))
+	// Combined positions+history read — the trade screen's 5s poll uses this
+	// so one tick is one HTTP call instead of two (each of which re-ran the
+	// ownership check), i.e. 2 database statements instead of 5.
+	mux.HandleFunc("/trading/state", api.RequireAuth(tokenIssuer, tradingHandler.PositionsAndHistory))
 
 	frontendOrigin := envOr("PROPFIRM_FRONTEND_ORIGIN", "http://localhost:3001")
 	handler := api.CORS(frontendOrigin, mux)

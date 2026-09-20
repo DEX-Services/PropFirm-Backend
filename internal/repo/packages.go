@@ -64,6 +64,10 @@ func (r *PackageRepo) Get(ctx context.Context, id string) (*models.Package, erro
 
 // PhasesFor returns a package's phases ordered by sort_order (step1 ->
 // step2 -> funded), so index 0 is always the first evaluation phase.
+//
+// Use this only when resolving a single package (provisioning, advancing a
+// phase, ticking one account). For rendering the catalog of many packages
+// at once, use PhasesForMany — see the note there.
 func (r *PackageRepo) PhasesFor(ctx context.Context, packageID string) ([]models.PackagePhase, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, package_id, phase, max_daily_loss_pct, max_total_loss_pct, profit_target_pct, min_trading_days, sort_order
@@ -83,6 +87,47 @@ func (r *PackageRepo) PhasesFor(ctx context.Context, packageID string) ([]models
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// PhasesForMany returns the phases of every package in packageIDs, grouped
+// by package id, each group ordered by sort_order — the exact same shape
+// and ordering PhasesFor guarantees for one package.
+//
+// This exists to keep GET /packages off a per-package query loop. The
+// catalog has ~15 packages, and calling PhasesFor once per package made the
+// endpoint issue 16 sequential queries. Against a remote database that is
+// pure round-trip cost (~1.9s at the ~119ms RTT of the current Aiven
+// instance) and it sits directly on the trade/profile page's first-paint
+// path. One ANY($1) query returns the same rows in a single round-trip.
+//
+// A package with no phase rows is simply absent from the result map, which
+// callers must treat the same way as an empty slice — never as an error.
+// An empty packageIDs returns an empty map without touching the database.
+func (r *PackageRepo) PhasesForMany(ctx context.Context, packageIDs []string) (map[string][]models.PackagePhase, error) {
+	out := make(map[string][]models.PackagePhase, len(packageIDs))
+	if len(packageIDs) == 0 {
+		return out, nil
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, package_id, phase, max_daily_loss_pct, max_total_loss_pct, profit_target_pct, min_trading_days, sort_order
+		FROM public.pf_package_phases
+		WHERE package_id = ANY($1)
+		ORDER BY package_id, sort_order
+	`, packageIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p models.PackagePhase
+		if err := rows.Scan(&p.ID, &p.PackageID, &p.Phase, &p.MaxDailyLossPct, &p.MaxTotalLossPct, &p.ProfitTargetPct, &p.MinTradingDays, &p.SortOrder); err != nil {
+			return nil, err
+		}
+		out[p.PackageID] = append(out[p.PackageID], p)
 	}
 	return out, rows.Err()
 }
