@@ -19,27 +19,55 @@ func NewAccountRepo(pool *pgxpool.Pool) *AccountRepo {
 	return &AccountRepo{pool: pool}
 }
 
+// accountRowScanner is satisfied by both pgx.Row (QueryRow) and pgx.Rows
+// (Query), letting scanAccountRow serve every read path below.
+type accountRowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+// scanAccountRow reads one pf_accounts row in the column order every query
+// in this file selects: id, user_id, package_id, current_phase_id, phase,
+// status, balance_bi2xusd, equity_bi2xusd, high_water_mark,
+// start_of_day_equity, trading_days_count, last_trading_day,
+// real_account_ref, created_at, updated_at.
+//
+// last_trading_day is scanned into a *time.Time, not *string: pgx v5's
+// binary protocol returns a DATE column as a native time value and errors
+// scanning it directly into a string pointer. That mismatch was latent
+// (every account's last_trading_day was NULL until RecordTradingDay's
+// market-order fix started actually writing it), so it only started
+// failing once real trades began recording a trading day.
+func scanAccountRow(row accountRowScanner) (*models.Account, error) {
+	var a models.Account
+	var lastTradingDay *time.Time
+	if err := row.Scan(
+		&a.ID, &a.UserID, &a.PackageID, &a.CurrentPhaseID, &a.Phase, &a.Status, &a.BalanceBI2XUSD, &a.EquityBI2XUSD,
+		&a.HighWaterMark, &a.StartOfDayEquity, &a.TradingDaysCount, &lastTradingDay, &a.RealAccountRef, &a.CreatedAt, &a.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if lastTradingDay != nil {
+		s := lastTradingDay.Format("2006-01-02")
+		a.LastTradingDay = &s
+	}
+	return &a, nil
+}
+
+const accountColumns = `id, user_id, package_id, current_phase_id, phase, status, balance_bi2xusd, equity_bi2xusd,
+			high_water_mark, start_of_day_equity, trading_days_count, last_trading_day, real_account_ref, created_at, updated_at`
+
 // Create opens a new pf_accounts row at a package's first phase (or the
 // only phase, "funded", for Instant Funding — PROP_FIRM_PLAN.md section
 // 7). Balance/equity/high-water-mark all start at the package's account
 // size; status starts "funded" for instant, "active" for evaluation
 // tracks.
 func (r *AccountRepo) Create(ctx context.Context, id, userID, packageID, firstPhaseID string, phase models.Phase, status models.AccountStatus, startBalance string) (*models.Account, error) {
-	var a models.Account
-	err := r.pool.QueryRow(ctx, `
+	row := r.pool.QueryRow(ctx, `
 		INSERT INTO public.pf_accounts
 			(id, user_id, package_id, current_phase_id, phase, status, balance_bi2xusd, equity_bi2xusd, high_water_mark, start_of_day_equity)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7, $7)
-		RETURNING id, user_id, package_id, current_phase_id, phase, status, balance_bi2xusd, equity_bi2xusd,
-			high_water_mark, start_of_day_equity, trading_days_count, last_trading_day, real_account_ref, created_at, updated_at
-	`, id, userID, packageID, firstPhaseID, phase, status, startBalance).Scan(
-		&a.ID, &a.UserID, &a.PackageID, &a.CurrentPhaseID, &a.Phase, &a.Status, &a.BalanceBI2XUSD, &a.EquityBI2XUSD,
-		&a.HighWaterMark, &a.StartOfDayEquity, &a.TradingDaysCount, &a.LastTradingDay, &a.RealAccountRef, &a.CreatedAt, &a.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &a, nil
+		RETURNING `+accountColumns, id, userID, packageID, firstPhaseID, phase, status, startBalance)
+	return scanAccountRow(row)
 }
 
 // Owns reports whether accountID belongs to userID, in one query.
@@ -62,22 +90,15 @@ func (r *AccountRepo) Owns(ctx context.Context, accountID, userID string) (bool,
 }
 
 func (r *AccountRepo) Get(ctx context.Context, id string) (*models.Account, error) {
-	var a models.Account
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, user_id, package_id, current_phase_id, phase, status, balance_bi2xusd, equity_bi2xusd,
-			high_water_mark, start_of_day_equity, trading_days_count, last_trading_day, real_account_ref, created_at, updated_at
-		FROM public.pf_accounts WHERE id = $1
-	`, id).Scan(
-		&a.ID, &a.UserID, &a.PackageID, &a.CurrentPhaseID, &a.Phase, &a.Status, &a.BalanceBI2XUSD, &a.EquityBI2XUSD,
-		&a.HighWaterMark, &a.StartOfDayEquity, &a.TradingDaysCount, &a.LastTradingDay, &a.RealAccountRef, &a.CreatedAt, &a.UpdatedAt,
-	)
+	row := r.pool.QueryRow(ctx, `SELECT `+accountColumns+` FROM public.pf_accounts WHERE id = $1`, id)
+	a, err := scanAccountRow(row)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &a, nil
+	return a, nil
 }
 
 // ListActiveAccountIDs supports simengine.Scheduler's tick loop — every
@@ -104,11 +125,7 @@ func (r *AccountRepo) ListActiveAccountIDs(ctx context.Context) ([]string, error
 // ListByUser supports the prop-firm frontend's dashboard: a trader may
 // hold more than one account (e.g. bought multiple challenges over time).
 func (r *AccountRepo) ListByUser(ctx context.Context, userID string) ([]models.Account, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, user_id, package_id, current_phase_id, phase, status, balance_bi2xusd, equity_bi2xusd,
-			high_water_mark, start_of_day_equity, trading_days_count, last_trading_day, real_account_ref, created_at, updated_at
-		FROM public.pf_accounts WHERE user_id = $1 ORDER BY created_at DESC
-	`, userID)
+	rows, err := r.pool.Query(ctx, `SELECT `+accountColumns+` FROM public.pf_accounts WHERE user_id = $1 ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -116,14 +133,11 @@ func (r *AccountRepo) ListByUser(ctx context.Context, userID string) ([]models.A
 
 	var out []models.Account
 	for rows.Next() {
-		var a models.Account
-		if err := rows.Scan(
-			&a.ID, &a.UserID, &a.PackageID, &a.CurrentPhaseID, &a.Phase, &a.Status, &a.BalanceBI2XUSD, &a.EquityBI2XUSD,
-			&a.HighWaterMark, &a.StartOfDayEquity, &a.TradingDaysCount, &a.LastTradingDay, &a.RealAccountRef, &a.CreatedAt, &a.UpdatedAt,
-		); err != nil {
+		a, err := scanAccountRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, a)
+		out = append(out, *a)
 	}
 	return out, rows.Err()
 }

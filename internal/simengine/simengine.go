@@ -73,6 +73,9 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		if err != nil {
 			return nil, fmt.Errorf("fetch price: %w", err)
 		}
+		if price == "" || price == "0" {
+			return nil, fmt.Errorf("no live price available for %s — cannot fill a market order", in.Symbol)
+		}
 		fee, err := chargeEntryFee(ctx, e.accounts, account.ID, price, in.Size, string(in.Market))
 		if err != nil {
 			return nil, err
@@ -80,7 +83,19 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		if err := chargeSpotNotional(ctx, e.accounts, account.ID, in.Market, price, in.Size); err != nil {
 			return nil, err
 		}
-		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String())
+		trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String())
+		if err != nil {
+			return nil, err
+		}
+		// A market order fills the instant it's placed, so today counts as a
+		// trading day right now — previously only limit/stop/take-profit
+		// fills (in fillPendingOrders) recorded this, leaving
+		// tradingDaysCount stuck at 0 for traders who only ever use market
+		// orders, permanently blocking the min-trading-days phase-pass gate.
+		if err := e.accounts.RecordTradingDay(ctx, account.ID, time.Now()); err != nil {
+			return nil, err
+		}
+		return trade, nil
 	case "limit", "stop_loss", "take_profit":
 		if in.TriggerPrice == nil {
 			return nil, fmt.Errorf("%s order requires a trigger price", in.OrderType)
@@ -156,6 +171,9 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	price, err := e.prices.Price(trade.Symbol, string(trade.Market))
 	if err != nil {
 		return fmt.Errorf("fetch price: %w", err)
+	}
+	if price == "" || price == "0" {
+		return fmt.Errorf("no live price available for %s — cannot close at a fabricated price", trade.Symbol)
 	}
 	pnl, err := pnlFor(*trade, price)
 	if err != nil {
@@ -373,6 +391,15 @@ func (e *Engine) unrealizedPnl(ctx context.Context, accountID string) (decimal.D
 		if err != nil {
 			continue // a transient price-fetch failure shouldn't crash the whole tick; skip this position this round
 		}
+		// A market with no live price feed reports "0", not an error — that
+		// is not a real price and must never be used for PnL: it would read
+		// as a catastrophic loss/gain against any real entry price and blow
+		// up equity by the position's entire notional value. Skip it exactly
+		// like a fetch error, keeping the position's last-known contribution
+		// out of this tick rather than substituting a fabricated number.
+		if price == "" || price == "0" {
+			continue
+		}
 		pnl, err := pnlFor(t, price)
 		if err != nil {
 			continue
@@ -392,8 +419,8 @@ func (e *Engine) fillPendingOrders(ctx context.Context, account *models.Account)
 			continue
 		}
 		price, err := e.prices.Price(t.Symbol, string(t.Market))
-		if err != nil {
-			continue
+		if err != nil || price == "" || price == "0" {
+			continue // no real price yet — a pending order must never fill against a fabricated $0 price
 		}
 		current, err := decimal.NewFromString(price)
 		if err != nil {
