@@ -41,6 +41,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	migrations := []migration{
 		{"core schema", ensureCoreSchema},
 		{"pf_trades fee columns", ensureTradeFeeColumns},
+		{"step1/step2 daily loss rules", ensureEvaluationDailyLossRules},
 	}
 	for _, m := range migrations {
 		if err := m.run(ctx, pool); err != nil {
@@ -172,6 +173,25 @@ func ensureTradeFeeColumns(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
 ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS entry_fee NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS exit_fee NUMERIC;
+`)
+	return err
+}
+
+// ensureEvaluationDailyLossRules backfills max_daily_loss_pct onto step1/
+// step2 phases for databases seeded before evaluation-stage accounts had a
+// daily-loss rule at all (previously only funded/live accounts did) —
+// SeedCatalog's ON CONFLICT DO NOTHING means the updated phasesForTrack
+// values in seed.go never reach a row that already exists, so this runs as
+// its own explicit UPDATE, same pattern as ensureTradeFeeColumns above.
+func ensureEvaluationDailyLossRules(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+UPDATE public.pf_package_phases pp
+SET max_daily_loss_pct = (CASE pk.track WHEN '1step' THEN '4' WHEN '2step' THEN '5' END)::numeric
+FROM public.pf_packages pk
+WHERE pp.package_id = pk.id
+  AND pp.phase IN ('step1', 'step2')
+  AND pk.track IN ('1step', '2step')
+  AND pp.max_daily_loss_pct IS NULL;
 `)
 	return err
 }

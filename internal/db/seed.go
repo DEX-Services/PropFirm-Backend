@@ -35,17 +35,17 @@ func phasesForTrack(track string) []phaseRule {
 		}
 	case "1step":
 		return []phaseRule{
-			// Step 1: max total loss 6%, profit target 10%, min 5 trading days.
-			{phase: "step1", maxDailyLoss: nil, maxTotalLoss: "6", profitTarget: strp("10"), minTradingDays: 5, sortOrder: 0},
+			// Step 1: daily loss 4%, max total loss 6%, profit target 10%, min 5 trading days.
+			{phase: "step1", maxDailyLoss: strp("4"), maxTotalLoss: "6", profitTarget: strp("10"), minTradingDays: 5, sortOrder: 0},
 			// Funded: daily loss 4%, total loss 6%, no profit target.
 			{phase: "funded", maxDailyLoss: strp("4"), maxTotalLoss: "6", profitTarget: nil, minTradingDays: 0, sortOrder: 1},
 		}
 	case "2step":
 		return []phaseRule{
-			// Step 1: max total loss 10%, profit target 10%, min 5 trading days.
-			{phase: "step1", maxDailyLoss: nil, maxTotalLoss: "10", profitTarget: strp("10"), minTradingDays: 5, sortOrder: 0},
-			// Step 2: max total loss 8%, profit target 5%, min 5 trading days.
-			{phase: "step2", maxDailyLoss: nil, maxTotalLoss: "8", profitTarget: strp("5"), minTradingDays: 5, sortOrder: 1},
+			// Step 1: daily loss 5%, max total loss 10%, profit target 10%, min 5 trading days.
+			{phase: "step1", maxDailyLoss: strp("5"), maxTotalLoss: "10", profitTarget: strp("10"), minTradingDays: 5, sortOrder: 0},
+			// Step 2: daily loss 5%, max total loss 8%, profit target 5%, min 5 trading days.
+			{phase: "step2", maxDailyLoss: strp("5"), maxTotalLoss: "8", profitTarget: strp("5"), minTradingDays: 5, sortOrder: 1},
 			// Funded: daily loss 5%, total loss 8%, no profit target.
 			{phase: "funded", maxDailyLoss: strp("5"), maxTotalLoss: "8", profitTarget: nil, minTradingDays: 0, sortOrder: 2},
 		}
