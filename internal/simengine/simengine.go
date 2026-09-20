@@ -283,11 +283,11 @@ func (e *Engine) Tick(ctx context.Context, accountID string) (TickResult, error)
 	if err != nil {
 		return result, err
 	}
-	unrealized, err := e.unrealizedPnl(ctx, accountID)
+	openContribution, err := e.openPositionsEquityContribution(ctx, accountID)
 	if err != nil {
 		return result, err
 	}
-	equity := balance.Add(unrealized)
+	equity := balance.Add(openContribution)
 
 	pkg, err := e.packages.Get(ctx, account.PackageID)
 	if err != nil {
@@ -380,7 +380,23 @@ type TickResult struct {
 	PassedPhase  bool
 }
 
-func (e *Engine) unrealizedPnl(ctx context.Context, accountID string) (decimal.Decimal, error) {
+// openPositionsEquityContribution sums what every currently-open position
+// contributes to equity on top of balance — and that contribution means two
+// different things depending on the market:
+//
+//   - FUTURES is margin-based: opening never moved the notional out of
+//     balance, only fees did, so an open futures position contributes just
+//     its unrealized PnL (the price delta), same as before.
+//   - SPOT is cash-based: opening already debited the FULL purchase cost
+//     out of balance (chargeSpotNotional), so balance alone understates net
+//     worth by the entire value of the asset now held. An open spot
+//     position must contribute its full current market value (price *
+//     size), not merely the price delta — using only the delta here was the
+//     actual bug behind accounts appearing to breach immediately after a
+//     large spot buy: balance dropped by the full notional, but only a
+//     tiny PnL delta was ever added back, making equity look like the
+//     trader had lost almost the entire notional the instant they bought.
+func (e *Engine) openPositionsEquityContribution(ctx context.Context, accountID string) (decimal.Decimal, error) {
 	open, err := e.trades.OpenPositionsFor(ctx, accountID)
 	if err != nil {
 		return decimal.Zero, err
@@ -398,6 +414,18 @@ func (e *Engine) unrealizedPnl(ctx context.Context, accountID string) (decimal.D
 		// like a fetch error, keeping the position's last-known contribution
 		// out of this tick rather than substituting a fabricated number.
 		if price == "" || price == "0" {
+			continue
+		}
+		if t.Market == models.MarketSpot {
+			size, err := decimal.NewFromString(t.Size)
+			if err != nil {
+				continue
+			}
+			current, err := decimal.NewFromString(price)
+			if err != nil {
+				continue
+			}
+			total = total.Add(current.Mul(size))
 			continue
 		}
 		pnl, err := pnlFor(t, price)
