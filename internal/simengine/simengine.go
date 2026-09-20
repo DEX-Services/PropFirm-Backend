@@ -137,11 +137,14 @@ func chargeSpotNotional(ctx context.Context, accounts *repo.AccountRepo, account
 
 // ClosePosition realizes a trade at the current price then charges the real
 // exit taker fee (section 11). For FUTURES (margin-based), the realized PnL
-// is banked into balance via the account's next Tick(), same as before. For
-// SPOT (cash-based, section 12), the original purchase cost was already
-// debited from balance at open time (chargeSpotNotional above), so closing
-// must credit back the full sale proceeds directly — crediting only the
-// PnL delta here would leave the original notional permanently missing.
+// is credited/debited into balance directly below — Tick() only ever sums
+// PnL across currently-*open* trades for the unrealized/equity figure, so a
+// trade that just closed drops out of that sum the moment it closes and its
+// PnL would otherwise never reach balance at all. For SPOT (cash-based,
+// section 12), the original purchase cost was already debited from balance
+// at open time (chargeSpotNotional above), so closing must credit back the
+// full sale proceeds directly — crediting only the PnL delta here would
+// leave the original notional permanently missing.
 func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	trade, err := e.trades.Get(ctx, tradeID)
 	if err != nil {
@@ -179,6 +182,18 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 		if proceeds.IsPositive() {
 			if err := e.accounts.CreditBalance(ctx, trade.AccountID, proceeds); err != nil {
 				return fmt.Errorf("credit spot proceeds: %w", err)
+			}
+		}
+	} else {
+		// FUTURES: margin-based, so only the PnL itself (not the notional)
+		// settles into balance — a gain credits, a loss debits.
+		if pnl.IsPositive() {
+			if err := e.accounts.CreditBalance(ctx, trade.AccountID, pnl); err != nil {
+				return fmt.Errorf("credit realized pnl: %w", err)
+			}
+		} else if pnl.IsNegative() {
+			if err := e.accounts.DebitBalance(ctx, trade.AccountID, pnl.Neg()); err != nil {
+				return fmt.Errorf("debit realized pnl: %w", err)
 			}
 		}
 	}
@@ -316,7 +331,7 @@ func (e *Engine) Tick(ctx context.Context, accountID string) (TickResult, error)
 		}
 	}
 
-	if err := e.accounts.UpdateEquity(ctx, accountID, account.BalanceBI2XUSD, equity.String(), equity.String()); err != nil {
+	if err := e.accounts.UpdateEquity(ctx, accountID, equity.String(), equity.String()); err != nil {
 		return result, err
 	}
 

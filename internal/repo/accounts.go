@@ -42,6 +42,25 @@ func (r *AccountRepo) Create(ctx context.Context, id, userID, packageID, firstPh
 	return &a, nil
 }
 
+// Owns reports whether accountID belongs to userID, in one query.
+//
+// This replaces fetching the whole account row just to compare its user_id.
+// On the frontend's 5-second poll that fetch was an extra round-trip per
+// tick purely for an authorization check, so the check is narrowed to a
+// single SELECT 1 against the primary key — same answer, less to send.
+func (r *AccountRepo) Owns(ctx context.Context, accountID, userID string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM public.pf_accounts WHERE id = $1 AND user_id = $2
+		)
+	`, accountID, userID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (r *AccountRepo) Get(ctx context.Context, id string) (*models.Account, error) {
 	var a models.Account
 	err := r.pool.QueryRow(ctx, `
@@ -109,16 +128,23 @@ func (r *AccountRepo) ListByUser(ctx context.Context, userID string) ([]models.A
 	return out, rows.Err()
 }
 
-// UpdateEquity is called on every price tick / trade close by the
-// simulated-trading engine to keep balance/equity/high-water-mark current.
-func (r *AccountRepo) UpdateEquity(ctx context.Context, id, balance, equity, highWaterMark string) error {
+// UpdateEquity is called on every price tick by the simulated-trading
+// engine to keep equity/high-water-mark current from unrealized PnL.
+// balance_bi2xusd is deliberately NOT written here: it's always already
+// correct in the database (DebitBalance/CreditBalance mutate it directly
+// the moment a fee, spot notional, or realized PnL happens), and Tick()
+// only ever reads a snapshot of it at the start of a run. Writing that
+// stale snapshot back here would silently clobber a debit/credit that
+// landed in the DB between Tick()'s read and this write — e.g. a trade
+// opened or closed in the few seconds between two scheduler ticks.
+func (r *AccountRepo) UpdateEquity(ctx context.Context, id, equity, highWaterMark string) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE public.pf_accounts
-		SET balance_bi2xusd = $2, equity_bi2xusd = $3,
-			high_water_mark = GREATEST(high_water_mark, $4::numeric),
-			updated_at = $5
+		SET equity_bi2xusd = $2,
+			high_water_mark = GREATEST(high_water_mark, $3::numeric),
+			updated_at = $4
 		WHERE id = $1
-	`, id, balance, equity, highWaterMark, time.Now())
+	`, id, equity, highWaterMark, time.Now())
 	return err
 }
 
