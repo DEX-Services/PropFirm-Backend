@@ -14,6 +14,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/dex/propfirm-backend/internal/liveengine"
 	"github.com/dex/propfirm-backend/internal/models"
 	"github.com/dex/propfirm-backend/internal/priceclient"
 	"github.com/dex/propfirm-backend/internal/repo"
@@ -24,11 +25,20 @@ type Engine struct {
 	packages *repo.PackageRepo
 	trades   *repo.TradeRepo
 	prices   *priceclient.Client
-	newID    func() string
+	// live places REAL orders on the real matching engine for funded
+	// accounts (PROP_FIRM_PLAN.md section 10) — see internal/liveengine's
+	// own doc comment for the omnibus/master-account model this implements.
+	// nil-safe: every live.* call already no-ops with a clear error via
+	// liveengine.Client.Enabled() when unconfigured, so a deployment that
+	// never sets MATCHING_ENGINE_URL/DEX_BACKEND_ENGINE_SECRET simply can't
+	// advance any account to funded in practice (accounts.Create doesn't
+	// require it), but doesn't crash if one somehow already is.
+	live  *liveengine.Client
+	newID func() string
 }
 
-func New(accounts *repo.AccountRepo, packages *repo.PackageRepo, trades *repo.TradeRepo, prices *priceclient.Client, newID func() string) *Engine {
-	return &Engine{accounts: accounts, packages: packages, trades: trades, prices: prices, newID: newID}
+func New(accounts *repo.AccountRepo, packages *repo.PackageRepo, trades *repo.TradeRepo, prices *priceclient.Client, live *liveengine.Client, newID func() string) *Engine {
+	return &Engine{accounts: accounts, packages: packages, trades: trades, prices: prices, live: live, newID: newID}
 }
 
 // OpenPositionInput is what a trader submits from the BitDX Prop Firm
@@ -63,6 +73,9 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 	if account == nil {
 		return nil, fmt.Errorf("account not found")
 	}
+	if account.Status == models.StatusFunded {
+		return e.openLivePosition(ctx, account, in)
+	}
 	if account.Status != models.StatusActive {
 		return nil, fmt.Errorf("account is not active (status=%s)", account.Status)
 	}
@@ -83,7 +96,7 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		if err := chargeSpotNotional(ctx, e.accounts, account.ID, in.Market, price, in.Size); err != nil {
 			return nil, err
 		}
-		trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String())
+		trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), price, in.Leverage, in.OrderType, nil, "open", fee.String(), false, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -104,7 +117,7 @@ func (e *Engine) OpenPosition(ctx context.Context, in OpenPositionInput) (*model
 		// entryPrice/entryFee are set once filled (see fillPendingOrders) —
 		// no fee is charged for merely placing a pending order, only on the
 		// actual fill, same as a real exchange.
-		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), "0", in.Leverage, in.OrderType, &trigger, "pending", "0")
+		return e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, in.Size.String(), "0", in.Leverage, in.OrderType, &trigger, "pending", "0", false, nil)
 	default:
 		return nil, fmt.Errorf("unknown order type %q", in.OrderType)
 	}
@@ -168,6 +181,9 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 	if trade == nil || trade.Status != "open" {
 		return fmt.Errorf("trade not open")
 	}
+	if trade.IsLive {
+		return e.closeLivePosition(ctx, trade)
+	}
 	price, err := e.prices.Price(trade.Symbol, string(trade.Market))
 	if err != nil {
 		return fmt.Errorf("fetch price: %w", err)
@@ -216,7 +232,7 @@ func (e *Engine) ClosePosition(ctx context.Context, tradeID string) error {
 		}
 	}
 
-	return e.trades.Close(ctx, tradeID, price, pnl.String(), exitFee.String())
+	return e.trades.Close(ctx, tradeID, price, pnl.String(), exitFee.String(), nil)
 }
 
 // CancelOrder drops a still-pending limit/stop-loss/take-profit order.
@@ -271,8 +287,11 @@ func (e *Engine) Tick(ctx context.Context, accountID string) (TickResult, error)
 	if account == nil {
 		return result, fmt.Errorf("account not found")
 	}
+	if account.Status == models.StatusFunded {
+		return e.liveTick(ctx, account)
+	}
 	if account.Status != models.StatusActive {
-		return result, nil // nothing to do for breached/passed/funded accounts
+		return result, nil // nothing to do for breached/passed accounts
 	}
 
 	if err := e.fillPendingOrders(ctx, account); err != nil {

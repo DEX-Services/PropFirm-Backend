@@ -42,6 +42,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		{"core schema", ensureCoreSchema},
 		{"pf_trades fee columns", ensureTradeFeeColumns},
 		{"step1/step2 daily loss rules", ensureEvaluationDailyLossRules},
+		{"pf_trades live-order columns", ensureTradeLiveColumns},
 	}
 	for _, m := range migrations {
 		if err := m.run(ctx, pool); err != nil {
@@ -173,6 +174,23 @@ func ensureTradeFeeColumns(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
 ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS entry_fee NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS exit_fee NUMERIC;
+`)
+	return err
+}
+
+// ensureTradeLiveColumns adds the columns a funded (live) account's real
+// trade needs that a simulated trade never did (PROP_FIRM_PLAN.md section
+// 10): is_live marks a trade as having been routed to the real matching
+// engine on the master omnibus account (liveengine.MasterAccountID) rather
+// than priced against simengine's simulated fill; entry_order_id/
+// exit_order_id are the real engine order IDs, kept for audit/reconciliation
+// so a real fill is always traceable back to the exact real order that
+// produced it.
+func ensureTradeLiveColumns(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS is_live BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS entry_order_id TEXT;
+ALTER TABLE public.pf_trades ADD COLUMN IF NOT EXISTS exit_order_id TEXT;
 `)
 	return err
 }

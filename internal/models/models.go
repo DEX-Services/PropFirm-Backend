@@ -139,28 +139,37 @@ type Account struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
-// Trade is one simulated position — pf_trades. Only used for evaluation
-// (simulated) accounts; live/funded accounts trade for real on the
-// exchange's own order book (section 10) and are not recorded here.
+// Trade is one position — pf_trades. Used for both evaluation (simulated)
+// AND funded/live accounts (PROP_FIRM_PLAN.md section 10): IsLive
+// distinguishes the two. A simulated trade's EntryPrice/ClosePrice are
+// simengine's own simulated fill against a live price feed, with no real
+// counterparty. A live trade (IsLive=true) is a REAL fill on the exchange's
+// real matching engine, placed on the shared master omnibus account (see
+// internal/liveengine) — EntryOrderID/ExitOrderID are that real order's ID,
+// kept for audit/reconciliation back to the exact real order that produced
+// each fill.
 type Trade struct {
-	ID             string     `json:"id"`
-	AccountID      string     `json:"accountId"`
-	Symbol         string     `json:"symbol"` // engine symbol, e.g. "BTC-BI2XUSD"
-	Market         Market     `json:"market"`
-	Side           Side       `json:"side"`
-	Size           string     `json:"size"`
-	EntryPrice     string     `json:"entryPrice"`
-	Leverage       int        `json:"leverage"` // always 1 for spot
-	ClosePrice     *string    `json:"closePrice,omitempty"`
-	RealizedPnl    *string    `json:"realizedPnl,omitempty"`
-	EntryFee       string     `json:"entryFee"` // real exchange taker fee, PROP_FIRM_PLAN.md section 11 — charged on fill, not an estimate
-	ExitFee        *string    `json:"exitFee,omitempty"`
-	OrderType      string     `json:"orderType"` // "market" | "limit" | "stop_loss" | "take_profit"
-	TriggerPrice   *string    `json:"triggerPrice,omitempty"` // set for limit/SL/TP, nil once filled/market
-	Status         string     `json:"status"`                 // "pending" | "open" | "closed" | "cancelled"
-	OpenedAt       *time.Time `json:"openedAt,omitempty"`
-	ClosedAt       *time.Time `json:"closedAt,omitempty"`
-	CreatedAt      time.Time  `json:"createdAt"`
+	ID           string     `json:"id"`
+	AccountID    string     `json:"accountId"`
+	Symbol       string     `json:"symbol"` // engine symbol, e.g. "BTC-BI2XUSD"
+	Market       Market     `json:"market"`
+	Side         Side       `json:"side"`
+	Size         string     `json:"size"`
+	EntryPrice   string     `json:"entryPrice"`
+	Leverage     int        `json:"leverage"` // always 1 for spot
+	ClosePrice   *string    `json:"closePrice,omitempty"`
+	RealizedPnl  *string    `json:"realizedPnl,omitempty"`
+	EntryFee     string     `json:"entryFee"` // real exchange taker fee, PROP_FIRM_PLAN.md section 11 — charged on fill, not an estimate
+	ExitFee      *string    `json:"exitFee,omitempty"`
+	OrderType    string     `json:"orderType"`              // "market" | "limit" | "stop_loss" | "take_profit"
+	TriggerPrice *string    `json:"triggerPrice,omitempty"` // set for limit/SL/TP, nil once filled/market
+	Status       string     `json:"status"`                 // "pending" | "open" | "closed" | "cancelled"
+	IsLive       bool       `json:"isLive"`                 // true = real fill on the real engine (funded account); false = simulated
+	EntryOrderID *string    `json:"entryOrderId,omitempty"` // real matching-engine order ID, IsLive trades only
+	ExitOrderID  *string    `json:"exitOrderId,omitempty"`  // real matching-engine order ID, IsLive trades only
+	OpenedAt     *time.Time `json:"openedAt,omitempty"`
+	ClosedAt     *time.Time `json:"closedAt,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
 }
 
 // ProfitCredit is the write-once audit ledger for real profit credited to a

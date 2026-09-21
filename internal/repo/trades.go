@@ -19,7 +19,7 @@ func NewTradeRepo(pool *pgxpool.Pool) *TradeRepo {
 }
 
 const tradeColumns = `id, account_id, symbol, market, side, size, entry_price, leverage, close_price, realized_pnl,
-	entry_fee, exit_fee, order_type, trigger_price, status, opened_at, closed_at, created_at`
+	entry_fee, exit_fee, order_type, trigger_price, status, is_live, entry_order_id, exit_order_id, opened_at, closed_at, created_at`
 
 func scanTrade(row interface {
 	Scan(dest ...interface{}) error
@@ -39,18 +39,22 @@ func scanTradeInto(row interface {
 }, t *models.Trade) error {
 	return row.Scan(
 		&t.ID, &t.AccountID, &t.Symbol, &t.Market, &t.Side, &t.Size, &t.EntryPrice, &t.Leverage, &t.ClosePrice, &t.RealizedPnl,
-		&t.EntryFee, &t.ExitFee, &t.OrderType, &t.TriggerPrice, &t.Status, &t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
+		&t.EntryFee, &t.ExitFee, &t.OrderType, &t.TriggerPrice, &t.Status, &t.IsLive, &t.EntryOrderID, &t.ExitOrderID, &t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
 	)
 }
 
 // Open creates a filled (market) or pending (limit/stop/take-profit)
-// simulated position. See PROP_FIRM_PLAN.md's account-types discussion:
-// market orders fill immediately at entryPrice; limit/stop/take-profit
-// orders start "pending" with a triggerPrice and are filled later by the
-// engine's price-tick loop. entryFee is the real taker fee already charged
-// against the account's balance at fill time (section 11) — recorded here
-// purely for display/audit, not applied again.
-func (r *TradeRepo) Open(ctx context.Context, id, accountID, symbol string, market models.Market, side models.Side, size, entryPrice string, leverage int, orderType string, triggerPrice *string, status, entryFee string) (*models.Trade, error) {
+// position — simulated for an evaluation account, or real (isLive=true,
+// entryOrderID set to the real matching-engine order ID) for a funded
+// account routed through internal/liveengine. See PROP_FIRM_PLAN.md's
+// account-types discussion: market orders fill immediately at entryPrice;
+// limit/stop/take-profit orders start "pending" with a triggerPrice and are
+// filled later by the engine's price-tick loop (simulated accounts only —
+// live orders are always filled synchronously, see liveOrderRouter).
+// entryFee is the real taker fee already charged against the account's
+// balance at fill time (section 11) — recorded here purely for
+// display/audit, not applied again.
+func (r *TradeRepo) Open(ctx context.Context, id, accountID, symbol string, market models.Market, side models.Side, size, entryPrice string, leverage int, orderType string, triggerPrice *string, status, entryFee string, isLive bool, entryOrderID *string) (*models.Trade, error) {
 	var openedAt *time.Time
 	if status == "open" {
 		now := time.Now()
@@ -58,9 +62,9 @@ func (r *TradeRepo) Open(ctx context.Context, id, accountID, symbol string, mark
 	}
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO public.pf_trades
-			(id, account_id, symbol, market, side, size, entry_price, leverage, order_type, trigger_price, status, opened_at, entry_fee)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		RETURNING `+tradeColumns, id, accountID, symbol, market, side, size, entryPrice, leverage, orderType, triggerPrice, status, openedAt, entryFee)
+			(id, account_id, symbol, market, side, size, entry_price, leverage, order_type, trigger_price, status, opened_at, entry_fee, is_live, entry_order_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		RETURNING `+tradeColumns, id, accountID, symbol, market, side, size, entryPrice, leverage, orderType, triggerPrice, status, openedAt, entryFee, isLive, entryOrderID)
 	return scanTrade(row)
 }
 
@@ -146,11 +150,13 @@ func (r *TradeRepo) Fill(ctx context.Context, id, fillPrice, entryFee string) er
 
 // Close realizes a position's PnL and marks it closed. exitFee is the real
 // taker fee charged on close (section 11) — already netted out of
-// realizedPnl by the caller, recorded here for display/audit.
-func (r *TradeRepo) Close(ctx context.Context, id, closePrice, realizedPnl, exitFee string) error {
+// realizedPnl by the caller, recorded here for display/audit. exitOrderID is
+// the real matching-engine order ID that performed the close, for a live
+// trade (nil for a simulated one).
+func (r *TradeRepo) Close(ctx context.Context, id, closePrice, realizedPnl, exitFee string, exitOrderID *string) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE public.pf_trades SET status = 'closed', close_price = $2, realized_pnl = $3, exit_fee = $4, closed_at = $5 WHERE id = $1
-	`, id, closePrice, realizedPnl, exitFee, time.Now())
+		UPDATE public.pf_trades SET status = 'closed', close_price = $2, realized_pnl = $3, exit_fee = $4, exit_order_id = $5, closed_at = $6 WHERE id = $1
+	`, id, closePrice, realizedPnl, exitFee, exitOrderID, time.Now())
 	return err
 }
 

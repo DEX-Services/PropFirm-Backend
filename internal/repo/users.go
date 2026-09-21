@@ -50,6 +50,33 @@ func (r *UserRepo) GetByUsername(ctx context.Context, username string) (*models.
 	return &u, nil
 }
 
+// GetByID fetches one user by ID — used by the change-password endpoint,
+// which authenticates via JWT (so it has the user ID, not the username).
+func (r *UserRepo) GetByID(ctx context.Context, id string) (*models.User, error) {
+	var u models.User
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, username, password_hash, email, exchange_account_ref, created_at
+		FROM public.pf_users WHERE id = $1
+	`, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Email, &u.ExchangeAccountRef, &u.CreatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// UpdatePasswordHash persists a new bcrypt hash after a successful
+// change-password (POST /auth/change-password). Returns pgx.ErrNoRows if
+// the user vanished mid-request.
+func (r *UserRepo) UpdatePasswordHash(ctx context.Context, id, passwordHash string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE public.pf_users SET password_hash = $2 WHERE id = $1
+	`, id, passwordHash)
+	return err
+}
+
 // UsernameExists is used by the username generator to avoid collisions.
 func (r *UserRepo) UsernameExists(ctx context.Context, username string) (bool, error) {
 	var exists bool

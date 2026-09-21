@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"github.com/dex/propfirm-backend/internal/api"
 	"github.com/dex/propfirm-backend/internal/auth"
 	"github.com/dex/propfirm-backend/internal/db"
+	"github.com/dex/propfirm-backend/internal/liveengine"
 	"github.com/dex/propfirm-backend/internal/priceclient"
 	"github.com/dex/propfirm-backend/internal/repo"
 	"github.com/dex/propfirm-backend/internal/simengine"
@@ -70,7 +72,11 @@ func main() {
 	_ = repo.NewProfitCreditRepo(pool) // wired in once the live-account credit path (section 10/13) is built
 
 	priceClient := priceclient.NewClient(envOr("PROPFIRM_ENGINE_URL", "http://localhost:8080"))
-	engine := simengine.New(accountsRepo, packagesRepo, tradesRepo, priceClient, newID)
+	liveEngineClient := liveengine.New()
+	if !liveEngineClient.Enabled() {
+		log.Println("MATCHING_ENGINE_URL or DEX_BACKEND_ENGINE_SECRET not set — funded (live) account trading is disabled")
+	}
+	engine := simengine.New(accountsRepo, packagesRepo, tradesRepo, priceClient, liveEngineClient, newID)
 
 	tickInterval := 5 * time.Second
 	scheduler := simengine.NewScheduler(accountsRepo, engine, tickInterval)
@@ -109,12 +115,23 @@ func main() {
 	mux.HandleFunc("/depth", depthHandler.Depth)
 	mux.HandleFunc("/trades", depthHandler.Trades)
 
+	// BI2X chart datafeed proxy — same passthrough the exchange's own
+	// backend exposes at /bi2x-chart/*, re-exposed here so the prop firm
+	// frontend's BI2X chart loads from its own origin (the upstream feed
+	// sends no CORS headers, so direct browser calls are blocked). Public:
+	// it leaks nothing but the same public candle data the exchange already
+	// serves, and CORS-wrapping below scopes it to the frontend origin.
+	mux.HandleFunc("/bi2x-chart/", api.BI2XChartProxy(slog.Default()))
+
 	// Server-to-server only — Dex-Backend calls this after a successful
 	// BI2XUSD debit (PROP_FIRM_PLAN.md section 3/13).
 	mux.HandleFunc("/internal/provision", api.RequireInternalSecret(internalSecret, provisionHandler.Provision))
 
 	// BitDX Prop Firm's own login (section 2).
 	mux.HandleFunc("/auth/login", authHandler.Login)
+	// Authenticated password change — verifies the current password before
+	// persisting the new bcrypt hash.
+	mux.HandleFunc("/auth/change-password", api.RequireAuth(tokenIssuer, authHandler.ChangePassword))
 
 	// Authenticated trader endpoints.
 	mux.HandleFunc("/accounts", api.RequireAuth(tokenIssuer, accountsHandler.List))

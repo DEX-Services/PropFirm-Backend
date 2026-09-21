@@ -102,10 +102,14 @@ func (r *AccountRepo) Get(ctx context.Context, id string) (*models.Account, erro
 }
 
 // ListActiveAccountIDs supports simengine.Scheduler's tick loop — every
-// account currently in "active" status (evaluation in progress), across
-// all users.
+// account currently in "active" (evaluation in progress) OR "funded" (live
+// trading, PROP_FIRM_PLAN.md section 10) status, across all users. A funded
+// account MUST be ticked exactly like an active one: Tick() branches
+// internally (see Engine.liveTick) to run real breach detection and real
+// force-close on the master account, so excluding "funded" here would
+// silently disable that entirely — the scheduler would simply never call it.
 func (r *AccountRepo) ListActiveAccountIDs(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `SELECT id FROM public.pf_accounts WHERE status = 'active'`)
+	rows, err := r.pool.Query(ctx, `SELECT id FROM public.pf_accounts WHERE status IN ('active', 'funded')`)
 	if err != nil {
 		return nil, err
 	}
