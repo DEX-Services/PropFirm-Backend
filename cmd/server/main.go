@@ -21,7 +21,9 @@ import (
 	"github.com/dex/propfirm-backend/internal/api"
 	"github.com/dex/propfirm-backend/internal/auth"
 	"github.com/dex/propfirm-backend/internal/db"
+	"github.com/dex/propfirm-backend/internal/dexbackendclient"
 	"github.com/dex/propfirm-backend/internal/liveengine"
+	"github.com/dex/propfirm-backend/internal/liverisk"
 	"github.com/dex/propfirm-backend/internal/priceclient"
 	"github.com/dex/propfirm-backend/internal/repo"
 	"github.com/dex/propfirm-backend/internal/simengine"
@@ -69,18 +71,33 @@ func main() {
 	usersRepo := repo.NewUserRepo(pool)
 	accountsRepo := repo.NewAccountRepo(pool)
 	tradesRepo := repo.NewTradeRepo(pool)
-	_ = repo.NewProfitCreditRepo(pool) // wired in once the live-account credit path (section 10/13) is built
+	profitCreditsRepo := repo.NewProfitCreditRepo(pool)
 
 	priceClient := priceclient.NewClient(envOr("PROPFIRM_ENGINE_URL", "http://localhost:8080"))
 	liveEngineClient := liveengine.New()
 	if !liveEngineClient.Enabled() {
 		log.Println("MATCHING_ENGINE_URL or DEX_BACKEND_ENGINE_SECRET not set — funded (live) account trading is disabled")
 	}
-	engine := simengine.New(accountsRepo, packagesRepo, tradesRepo, priceClient, liveEngineClient, newID)
+	dexBackendClient := dexbackendclient.New()
+	if !dexBackendClient.Enabled() {
+		log.Println("DEX_BACKEND_URL or DEX_BACKEND_ENGINE_SECRET not set — real profit-split payouts for funded accounts are disabled")
+	}
+	engine := simengine.New(accountsRepo, packagesRepo, tradesRepo, usersRepo, profitCreditsRepo, priceClient, liveEngineClient, dexBackendClient, newID)
 
 	tickInterval := 5 * time.Second
 	scheduler := simengine.NewScheduler(accountsRepo, engine, tickInterval)
 	go scheduler.Run(ctx)
+
+	// Event-driven risk monitor for funded accounts (PROP_FIRM_PLAN.md
+	// section 10): reacts to matching-engine's real trade events instead of
+	// waiting for the 5s scheduler above, which keeps running regardless as
+	// the safety-net fallback.
+	if liveRisk, ok := liverisk.New(tradesRepo, engine, slog.Default()); ok {
+		go liveRisk.Run(ctx)
+		log.Println("event-driven live risk monitor connected to matching-engine's Kafka")
+	} else {
+		log.Println("MATCHING_ENGINE_KAFKA_HOST/PORT not set — funded accounts rely on the 5s poll only, no event-driven risk monitor")
+	}
 
 	tokenIssuer := auth.NewTokenIssuer(mustEnv("PROPFIRM_JWT_SECRET"), 24*time.Hour)
 	internalSecret := mustEnv("PROPFIRM_INTERNAL_SECRET")

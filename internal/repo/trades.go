@@ -92,6 +92,33 @@ func (r *TradeRepo) PendingOrdersFor(ctx context.Context, accountID string) ([]m
 	return r.listByAccountAndStatus(ctx, accountID, "pending")
 }
 
+// AccountIDsWithOpenLiveSymbol returns every account with a currently open
+// LIVE (real, funded-account) position on symbol — internal/liverisk's
+// event-driven risk monitor uses this to know which funded accounts to
+// re-check the instant a real trade happens on that symbol, instead of
+// ticking every funded account on every event regardless of what they
+// actually hold.
+func (r *TradeRepo) AccountIDsWithOpenLiveSymbol(ctx context.Context, symbol string) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT account_id FROM public.pf_trades
+		WHERE symbol = $1 AND status = 'open' AND is_live = true
+	`, symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (r *TradeRepo) listByAccountAndStatus(ctx context.Context, accountID, status string) ([]models.Trade, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+tradeColumns+`
@@ -157,6 +184,17 @@ func (r *TradeRepo) Close(ctx context.Context, id, closePrice, realizedPnl, exit
 	_, err := r.pool.Exec(ctx, `
 		UPDATE public.pf_trades SET status = 'closed', close_price = $2, realized_pnl = $3, exit_fee = $4, exit_order_id = $5, closed_at = $6 WHERE id = $1
 	`, id, closePrice, realizedPnl, exitFee, exitOrderID, time.Now())
+	return err
+}
+
+// ReduceSize shrinks an OPEN live trade's recorded size after a real
+// PARTIAL close fill — the position on the real engine is now smaller than
+// what this row still claims, and this brings the row back in sync without
+// closing it (the remainder is still genuinely open and must still be
+// tracked/breach-checked). Stays "open"; only Close ever transitions to
+// "closed". See simengine.closeLivePosition's partial-fill handling.
+func (r *TradeRepo) ReduceSize(ctx context.Context, id, newSize string) error {
+	_, err := r.pool.Exec(ctx, `UPDATE public.pf_trades SET size = $2 WHERE id = $1 AND status = 'open'`, id, newSize)
 	return err
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"github.com/dex/propfirm-backend/internal/dexbackendclient"
 	"github.com/dex/propfirm-backend/internal/liveengine"
 	"github.com/dex/propfirm-backend/internal/models"
 	"github.com/dex/propfirm-backend/internal/priceclient"
@@ -24,6 +25,8 @@ type Engine struct {
 	accounts *repo.AccountRepo
 	packages *repo.PackageRepo
 	trades   *repo.TradeRepo
+	users    *repo.UserRepo
+	profits  *repo.ProfitCreditRepo
 	prices   *priceclient.Client
 	// live places REAL orders on the real matching engine for funded
 	// accounts (PROP_FIRM_PLAN.md section 10) — see internal/liveengine's
@@ -33,12 +36,20 @@ type Engine struct {
 	// never sets MATCHING_ENGINE_URL/DEX_BACKEND_ENGINE_SECRET simply can't
 	// advance any account to funded in practice (accounts.Create doesn't
 	// require it), but doesn't crash if one somehow already is.
-	live  *liveengine.Client
-	newID func() string
+	live *liveengine.Client
+	// dexBackend credits a funded trader's REAL exchange wallet with their
+	// 80% share of realized live profit, and records the platform's 20%
+	// share as real treasury revenue (PROP_FIRM_PLAN.md section 11/13) — see
+	// closeLivePosition's profit-split logic in live.go. Nil-safe the same
+	// way live is: a deployment without DEX_BACKEND_URL configured simply
+	// can't complete a profitable live close (see creditProfitSplit's error
+	// handling), rather than silently losing track of the split.
+	dexBackend *dexbackendclient.Client
+	newID      func() string
 }
 
-func New(accounts *repo.AccountRepo, packages *repo.PackageRepo, trades *repo.TradeRepo, prices *priceclient.Client, live *liveengine.Client, newID func() string) *Engine {
-	return &Engine{accounts: accounts, packages: packages, trades: trades, prices: prices, live: live, newID: newID}
+func New(accounts *repo.AccountRepo, packages *repo.PackageRepo, trades *repo.TradeRepo, users *repo.UserRepo, profits *repo.ProfitCreditRepo, prices *priceclient.Client, live *liveengine.Client, dexBackend *dexbackendclient.Client, newID func() string) *Engine {
+	return &Engine{accounts: accounts, packages: packages, trades: trades, users: users, profits: profits, prices: prices, live: live, dexBackend: dexBackend, newID: newID}
 }
 
 // OpenPositionInput is what a trader submits from the BitDX Prop Firm
