@@ -133,22 +133,29 @@ func (c *Client) SubmitOrder(ctx context.Context, o Order) (OrderResult, error) 
 	return out, err
 }
 
-// ForceClose places a real reduce-only MARKET order on the master account to
-// flatten exactly `qty` of `symbol`'s position in the direction opposite the
-// trader's own side — the real-money equivalent of simengine.ClosePosition,
-// used when Tick() detects a funded account breaching its loss limits
+// ForceClose places a real MARKET order on the master account to flatten
+// exactly `qty` of `symbol`'s position (FUTURES) or holding (SPOT) in the
+// direction opposite the trader's own side — the real-money equivalent of
+// simengine.ClosePosition, used both for a trader's own voluntary close and
+// when Tick() detects a funded account breaching its loss limits
 // (PROP_FIRM_PLAN.md section 10's force-liquidation requirement). Real
-// slippage between the price that triggered the breach check and this
-// order's actual fill is expected and correct, same as any real broker's
+// slippage between the price that triggered the check and this order's
+// actual fill is expected and correct, same as any real broker's
 // margin-call liquidation — never something to paper over.
-func (c *Client) ForceClose(ctx context.Context, symbol, traderSide, qty string) (OrderResult, error) {
+//
+// reduceOnly is only meaningful for FUTURES (matching-engine's own
+// checkReduceOnly ignores it entirely for SPOT, which has no "position" to
+// reduce, only a balance to sell) — always true here since FUTURES is the
+// only market where the engine enforces it; SPOT is a plain market sell of
+// exactly qty either way.
+func (c *Client) ForceClose(ctx context.Context, symbol, market, traderSide, qty string) (OrderResult, error) {
 	closeSide := "SELL"
 	if traderSide == "short" {
 		closeSide = "BUY"
 	}
 	return c.SubmitOrder(ctx, Order{
 		Symbol:     symbol,
-		Market:     "FUTURES",
+		Market:     market,
 		Side:       closeSide,
 		Type:       "MARKET",
 		Qty:        qty,

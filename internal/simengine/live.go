@@ -19,38 +19,44 @@ import (
 	"github.com/dex/propfirm-backend/internal/models"
 )
 
-// Live trading is deliberately scoped to FUTURES market orders only for
-// this pass — the same instrument type/order type combination
-// PROP_FIRM_PLAN.md section 10 describes, and the smallest surface that
-// still exercises the full real order → real fill → real force-close path.
-// SPOT and limit/stop/take-profit live orders are not implemented; a
-// request for either is rejected with a clear error rather than silently
-// falling back to a simulated fill (which would be trading a funded
-// account's real capital on a fake price).
+// Live trading is deliberately scoped to MARKET orders only for this pass —
+// both FUTURES and SPOT are supported, but never limit/stop-loss/
+// take-profit: a real, funded account has no attached-order UI in this
+// release, and a request for one is rejected with a clear error rather than
+// silently falling back to a simulated fill (which would be trading a
+// funded account's real capital on a fake price). Every live order, SPOT or
+// FUTURES, is placed on the shared master account (internal/liveengine),
+// never an account of the trader's own — see that package's doc comment.
 func (e *Engine) openLivePosition(ctx context.Context, account *models.Account, in OpenPositionInput) (*models.Trade, error) {
 	if e.live == nil || !e.live.Enabled() {
 		return nil, fmt.Errorf("live trading is not available right now")
 	}
-	if in.Market != models.MarketFutures {
-		return nil, fmt.Errorf("live accounts can only trade FUTURES in this release")
+	if in.Market != models.MarketFutures && in.Market != models.MarketSpot {
+		return nil, fmt.Errorf("unknown market %q", in.Market)
 	}
 	if in.OrderType != "market" {
 		return nil, fmt.Errorf("live accounts can only place market orders in this release")
+	}
+	if in.Market == models.MarketSpot {
+		in.Leverage = 1 // spot is always cash, never leveraged — same rule as simengine's simulated path
 	}
 
 	side := "BUY"
 	if in.Side == models.SideShort {
 		side = "SELL"
 	}
-	leverage := in.Leverage
-	result, err := e.live.SubmitOrder(ctx, liveengine.Order{
-		Symbol:   in.Symbol,
-		Market:   "FUTURES",
-		Side:     side,
-		Type:     "MARKET",
-		Qty:      in.Size.String(),
-		Leverage: &leverage,
-	})
+	order := liveengine.Order{
+		Symbol: in.Symbol,
+		Market: string(in.Market),
+		Side:   side,
+		Type:   "MARKET",
+		Qty:    in.Size.String(),
+	}
+	if in.Market == models.MarketFutures {
+		leverage := in.Leverage
+		order.Leverage = &leverage
+	}
+	result, err := e.live.SubmitOrder(ctx, order)
 	if err != nil {
 		return nil, fmt.Errorf("live order rejected: %w", err)
 	}
@@ -83,6 +89,19 @@ func (e *Engine) openLivePosition(ctx context.Context, account *models.Account, 
 	price, err := e.prices.Price(in.Symbol, string(in.Market))
 	if err != nil || price == "" || price == "0" {
 		return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but no price could be recorded — contact support immediately, this must be reconciled manually", result.OrderID, filledSize)
+	}
+
+	if in.Market == models.MarketSpot {
+		// SPOT is cash, not margin (section 12): the master account just
+		// spent real BI2XUSD on the real book to buy this. The trader's own
+		// PropFirm balance must reflect that real cash outflow immediately,
+		// exactly like the simulated path's chargeSpotNotional — otherwise
+		// liveTick's equity math would have no way to know this trader's
+		// share of the master's real cash dropped by the notional this
+		// order actually cost.
+		if err := chargeSpotNotional(ctx, e.accounts, account.ID, in.Market, price, filled); err != nil {
+			return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but the real cash cost could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, filledSize, err)
+		}
 	}
 
 	trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, filledSize, price, in.Leverage, in.OrderType, nil, "open", "0", true, &result.OrderID)
@@ -123,7 +142,7 @@ func (e *Engine) closeLivePosition(ctx context.Context, trade *models.Trade) err
 	if e.live == nil || !e.live.Enabled() {
 		return fmt.Errorf("live trading is not available right now")
 	}
-	result, err := e.live.ForceClose(ctx, trade.Symbol, string(trade.Side), trade.Size)
+	result, err := e.live.ForceClose(ctx, trade.Symbol, string(trade.Market), string(trade.Side), trade.Size)
 	if err != nil {
 		return fmt.Errorf("live close rejected: %w", err)
 	}
@@ -166,7 +185,7 @@ func (e *Engine) closeLivePosition(ctx context.Context, trade *models.Trade) err
 		if err != nil {
 			return err
 		}
-		if err := e.settleRealizedLivePnl(ctx, trade.AccountID, pnl); err != nil {
+		if err := e.settleRealizedLiveClose(ctx, &partial, price, pnl); err != nil {
 			return err
 		}
 		remaining := requestedSize.Sub(filled)
@@ -174,7 +193,7 @@ func (e *Engine) closeLivePosition(ctx context.Context, trade *models.Trade) err
 			return fmt.Errorf("position partially closed on the real engine (order %s, filled %s) but the remaining size could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, result.Filled, err)
 		}
 		if pnl.IsPositive() {
-			e.creditProfitSplit(ctx, trade, pnl)
+			e.creditProfitSplit(ctx, trade, pnl, result.OrderID)
 		}
 		return fmt.Errorf("live close only partially filled (order %s: filled %s of %s) — remaining %s stays open on the real engine, will retry", result.OrderID, result.Filled, trade.Size, remaining.String())
 	}
@@ -183,29 +202,57 @@ func (e *Engine) closeLivePosition(ctx context.Context, trade *models.Trade) err
 	if err != nil {
 		return err
 	}
-	if err := e.settleRealizedLivePnl(ctx, trade.AccountID, pnl); err != nil {
+	if err := e.settleRealizedLiveClose(ctx, trade, price, pnl); err != nil {
 		return err
 	}
 	if err := e.trades.Close(ctx, trade.ID, price, pnl.String(), "0", &result.OrderID); err != nil {
 		return err
 	}
 	if pnl.IsPositive() {
-		e.creditProfitSplit(ctx, trade, pnl)
+		e.creditProfitSplit(ctx, trade, pnl, result.OrderID)
 	}
 	return nil
 }
 
-// settleRealizedLivePnl applies pnl (positive or negative) to accountID's
+// settleRealizedLiveClose applies a real close's effect on accountID's
 // PropFirm balance — shared by both the full-close and partial-close paths
-// in closeLivePosition so the exact same credit/debit logic never drifts
-// between the two.
-func (e *Engine) settleRealizedLivePnl(ctx context.Context, accountID string, pnl decimal.Decimal) error {
+// in closeLivePosition so the exact same logic never drifts between the
+// two. The two markets settle differently, same split as the simulated
+// engine's ClosePosition:
+//   - FUTURES is margin-based: only the PnL itself (win or loss) moves the
+//     balance, since opening never moved the notional out in the first
+//     place.
+//   - SPOT is cash-based: the notional was already debited in full at open
+//     time (chargeSpotNotional in openLivePosition), so closing must credit
+//     back the FULL real sale proceeds (price * filledTrade.Size), not just
+//     the PnL delta — crediting only the delta would leave the original
+//     notional permanently missing from the trader's balance, the exact bug
+//     already fixed once for the simulated engine (see simengine.go's
+//     ClosePosition doc comment).
+func (e *Engine) settleRealizedLiveClose(ctx context.Context, filledTrade *models.Trade, closePriceStr string, pnl decimal.Decimal) error {
+	if filledTrade.Market == models.MarketSpot {
+		closePrice, err := decimal.NewFromString(closePriceStr)
+		if err != nil {
+			return fmt.Errorf("parse close price: %w", err)
+		}
+		size, err := decimal.NewFromString(filledTrade.Size)
+		if err != nil {
+			return fmt.Errorf("parse trade size: %w", err)
+		}
+		proceeds := closePrice.Mul(size)
+		if proceeds.IsPositive() {
+			if err := e.accounts.CreditBalance(ctx, filledTrade.AccountID, proceeds); err != nil {
+				return fmt.Errorf("credit real spot proceeds: %w", err)
+			}
+		}
+		return nil
+	}
 	if pnl.IsPositive() {
-		if err := e.accounts.CreditBalance(ctx, accountID, pnl); err != nil {
+		if err := e.accounts.CreditBalance(ctx, filledTrade.AccountID, pnl); err != nil {
 			return fmt.Errorf("credit realized live pnl: %w", err)
 		}
 	} else if pnl.IsNegative() {
-		if err := e.accounts.DebitBalance(ctx, accountID, pnl.Neg()); err != nil {
+		if err := e.accounts.DebitBalance(ctx, filledTrade.AccountID, pnl.Neg()); err != nil {
 			return fmt.Errorf("debit realized live pnl: %w", err)
 		}
 	}
@@ -213,14 +260,26 @@ func (e *Engine) settleRealizedLivePnl(ctx context.Context, accountID string, pn
 }
 
 // creditProfitSplit pays out the real 80/20 split of a live trade's
-// realized profit. Called only after ClosePosition/trades.Close already
+// realized profit from ONE real close fill (identified by closeOrderID, the
+// real engine order that produced it). Called only after
+// ClosePosition/trades.Close (or ReduceSize, for a partial close) already
 // succeeded — a real fill happened and PropFirm's own ledger already
 // reflects it, so a payout failure here must never look like the trade
 // itself failed. Errors are logged via the write-once audit row's own
 // absence (no pf_profit_credits row means the payout never completed) —
 // there is deliberately no error return here for the caller to propagate,
 // since the trade close it followed already fully succeeded.
-func (e *Engine) creditProfitSplit(ctx context.Context, trade *models.Trade, grossProfit decimal.Decimal) {
+//
+// closeOrderID, not trade.ID, is the idempotency-key basis: a single
+// pf_trades row can close across MULTIPLE real fills (a partial close
+// followed later by closing the remainder — see closeLivePosition), each
+// producing its own real order ID and its own real profit share. Keying on
+// trade.ID alone made every fill after the first look like a retry of the
+// same payout to Dex-Backend's CreditBalanceIdempotent and silently
+// swallowed it — a real bug found via this exact partial-then-final spot
+// close scenario, where the second (remainder) close's real profit share
+// never reached the trader's wallet at all.
+func (e *Engine) creditProfitSplit(ctx context.Context, trade *models.Trade, grossProfit decimal.Decimal, closeOrderID string) {
 	if e.dexBackend == nil || !e.dexBackend.Enabled() {
 		return // logged nowhere further up the stack has a logger; the missing pf_profit_credits row is the durable signal something never ran
 	}
@@ -240,21 +299,23 @@ func (e *Engine) creditProfitSplit(ctx context.Context, trade *models.Trade, gro
 	exchangeShareRaw := toEngineRawUnits(exchangeShare)
 
 	if traderShareRaw != "0" {
-		// idempotencyKey = this trade's own id: a retried call for the SAME
-		// close (e.g. this function somehow ran twice) is recognized and
-		// skipped by Dex-Backend's CreditBalanceIdempotent rather than
-		// double-paying the trader.
-		if err := e.dexBackend.CreditRealBalance(ctx, *user.ExchangeAccountRef, traderShareRaw, "propfirm-profit:"+trade.ID); err != nil {
+		// idempotencyKey = this specific real close order's id: a genuine
+		// network-retry of the SAME close fill reuses the same order id and
+		// is correctly recognized/skipped by Dex-Backend's
+		// CreditBalanceIdempotent, while a DIFFERENT fill on the same trade
+		// (partial then remainder) always gets its own real order id and so
+		// is never mistaken for a duplicate.
+		if err := e.dexBackend.CreditRealBalance(ctx, *user.ExchangeAccountRef, traderShareRaw, "propfirm-profit:"+closeOrderID); err != nil {
 			return // no pf_profit_credits row will be written below; that absence is the signal to investigate
 		}
 	}
 	if exchangeShareRaw != "0" {
-		if err := e.dexBackend.CreditTreasury(ctx, exchangeShareRaw, *user.ExchangeAccountRef, trade.ID); err != nil {
+		if err := e.dexBackend.CreditTreasury(ctx, exchangeShareRaw, *user.ExchangeAccountRef, closeOrderID); err != nil {
 			return
 		}
 	}
 
-	_ = e.profits.Record(ctx, e.newID(), trade.AccountID, trade.ID, grossProfit.String(), traderShare.String(), exchangeShare.String())
+	_ = e.profits.Record(ctx, e.newID(), trade.AccountID, closeOrderID, grossProfit.String(), traderShare.String(), exchangeShare.String())
 }
 
 // toEngineRawUnits converts a human-decimal BI2XUSD amount to the raw
@@ -395,11 +456,18 @@ func (e *Engine) liveTick(ctx context.Context, account *models.Account) (TickRes
 }
 
 // liveEquityContribution mirrors openPositionsEquityContribution's role for
-// a funded account's live positions specifically: it reports the real
-// current unrealized PnL (margin-style, matching FUTURES semantics, which
-// is the only live market supported) across every open live trade — used
-// by liveTick, kept separate from the simulated path's equity math so a
-// change to one can never silently affect the other.
+// a funded account's live positions specifically — used by liveTick, kept
+// separate from the simulated path's equity math so a change to one can
+// never silently affect the other. Same FUTURES-vs-SPOT split as the
+// simulated engine's own equity math:
+//   - FUTURES (margin-based): contributes its unrealized PnL delta, since
+//     opening never moved the notional out of balance.
+//   - SPOT (cash-based): contributes its full current market value
+//     (price * size), since the notional already left balance at open
+//     (chargeSpotNotional) — using only the delta here would be the exact
+//     "instant false breach on a large spot buy" bug already fixed once
+//     for the simulated engine (see openPositionsEquityContribution's doc
+//     comment).
 func (e *Engine) liveEquityContribution(ctx context.Context, accountID string) (decimal.Decimal, error) {
 	open, err := e.trades.OpenPositionsFor(ctx, accountID)
 	if err != nil {
@@ -412,6 +480,18 @@ func (e *Engine) liveEquityContribution(ctx context.Context, accountID string) (
 		}
 		price, err := e.prices.Price(t.Symbol, string(t.Market))
 		if err != nil || price == "" || price == "0" {
+			continue
+		}
+		if t.Market == models.MarketSpot {
+			size, err := decimal.NewFromString(t.Size)
+			if err != nil {
+				continue
+			}
+			current, err := decimal.NewFromString(price)
+			if err != nil {
+				continue
+			}
+			total = total.Add(current.Mul(size))
 			continue
 		}
 		pnl, err := pnlFor(t, price)
