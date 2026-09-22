@@ -48,12 +48,13 @@ type openOrderRequest struct {
 	TriggerPrice string `json:"triggerPrice,omitempty"`
 }
 
-// OpenOrder handles POST /trading/orders — places a market order
-// (fills immediately against the live price) or a pending limit/
-// stop-loss/take-profit order (filled later by the tick loop). Note: this
-// path is for simulated (evaluation-stage) accounts only. A funded/live
-// account routes through the exchange's real order-placement API instead
-// (PROP_FIRM_PLAN.md section 10) — not built in this pass.
+// OpenOrder handles POST /trading/orders — places a market order (fills
+// immediately against the live price) or a pending limit order (filled
+// later, once its condition is met). For an evaluation account this is
+// simulated (stop-loss/take-profit included); for a funded (live) account,
+// simengine.OpenPosition routes market and limit orders to the real
+// matching engine instead (PROP_FIRM_PLAN.md section 10) — stop-loss/
+// take-profit are not yet supported for live accounts.
 func (h *TradingHandler) OpenOrder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")

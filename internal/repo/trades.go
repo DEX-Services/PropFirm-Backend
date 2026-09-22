@@ -175,6 +175,22 @@ func (r *TradeRepo) Fill(ctx context.Context, id, fillPrice, entryFee string) er
 	return err
 }
 
+// FillLive transitions a pending LIVE limit order to open with its real,
+// authoritative fill details — size AND price, unlike Fill (used only by
+// the simulated engine, where a pending order's recorded size never
+// changes: its trigger condition is all-or-nothing against a price feed).
+// A real limit order can fill for less than originally requested (partial
+// fill, then the order goes terminal with nothing left resting) or, more
+// rarely, be found already filled for its full size — either way,
+// reconcileLivePendingOrders always passes the real engine's own filled
+// quantity here, never the originally requested one.
+func (r *TradeRepo) FillLive(ctx context.Context, id, fillPrice, fillSize string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE public.pf_trades SET status = 'open', entry_price = $2, size = $3, trigger_price = NULL, opened_at = $4 WHERE id = $1
+	`, id, fillPrice, fillSize, time.Now())
+	return err
+}
+
 // Close realizes a position's PnL and marks it closed. exitFee is the real
 // taker fee charged on close (section 11) — already netted out of
 // realizedPnl by the caller, recorded here for display/audit. exitOrderID is

@@ -163,6 +163,83 @@ func (c *Client) ForceClose(ctx context.Context, symbol, market, traderSide, qty
 	})
 }
 
+// CancelOrder cancels a still-resting real order on the master account.
+// Used when a funded trader cancels their own pending limit order before it
+// fills — matching-engine's own /cancel is account+symbol+market+order_id
+// scoped, so it can only ever cancel the exact order asked for, never a
+// different trader's resting order that happens to share a symbol.
+func (c *Client) CancelOrder(ctx context.Context, symbol, market, orderID string) (OrderResult, error) {
+	q := url.Values{"account": {MasterAccountID}, "symbol": {symbol}, "market": {market}, "order_id": {orderID}}
+	var out OrderResult
+	err := c.call(ctx, http.MethodPost, "/cancel", q, &out)
+	return out, err
+}
+
+// OpenOrder mirrors one entry of matching-engine's real OpenOrderDTO — a
+// still-resting (OPEN or PARTIALLY_FILLED) order on the master account.
+// Once an order fully fills or is cancelled/rejected it stops appearing
+// here at all (see OrderHistory for that case).
+type OpenOrder struct {
+	ID     string `json:"id"`
+	Symbol string `json:"symbol"`
+	Market string `json:"market"`
+	Side   string `json:"side"`
+	Price  string `json:"price"`
+	Qty    string `json:"qty"`
+	Filled string `json:"filled"`
+	Status string `json:"status"`
+}
+
+type openOrdersResponse struct {
+	Orders []OpenOrder `json:"orders"`
+}
+
+// OpenOrders returns every still-resting real order on the master account
+// (across every funded trader's pending limit orders) — used by
+// reconcileLivePendingOrder to find a specific pending trade's real order
+// and check whether it has partially filled while still resting.
+func (c *Client) OpenOrders(ctx context.Context) ([]OpenOrder, error) {
+	var out openOrdersResponse
+	err := c.call(ctx, http.MethodGet, "/orders", url.Values{"account": {MasterAccountID}}, &out)
+	return out.Orders, err
+}
+
+// HistoryOrder mirrors one entry of matching-engine's real OrderHistoryDTO —
+// a TERMINAL (filled, cancelled, or rejected) order, with the authoritative
+// average fill price across every fill that settled it.
+type HistoryOrder struct {
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	Filled       string `json:"filled"`
+	AvgFillPrice string `json:"avgFillPrice"`
+}
+
+type orderHistoryResponse struct {
+	Orders []HistoryOrder `json:"orders"`
+}
+
+// FindOrderInHistory looks up one specific real order's terminal outcome by
+// ID — used once a pending limit order's ID no longer appears in
+// OpenOrders, meaning it reached a terminal state (fully filled, cancelled,
+// or rejected) and its real average fill price/quantity must be read from
+// history instead. Fetches a bounded recent page for (symbol, market) and
+// searches it client-side, since matching-engine's /order-history has no
+// single-order-by-id filter — orderID identifies the exact match within
+// that page, not the page's own scope.
+func (c *Client) FindOrderInHistory(ctx context.Context, symbol, market, orderID string) (*HistoryOrder, error) {
+	q := url.Values{"account": {MasterAccountID}, "symbol": {symbol}, "market": {market}, "limit": {"50"}}
+	var out orderHistoryResponse
+	if err := c.call(ctx, http.MethodGet, "/order-history", q, &out); err != nil {
+		return nil, err
+	}
+	for i := range out.Orders {
+		if out.Orders[i].ID == orderID {
+			return &out.Orders[i], nil
+		}
+	}
+	return nil, nil
+}
+
 // FuturesPosition mirrors one entry of matching-engine's real
 // FuturesPositionDTO — the MASTER account's aggregate position for a
 // symbol, i.e. the sum across every funded trader currently holding that

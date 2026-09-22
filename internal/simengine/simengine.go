@@ -255,6 +255,9 @@ func (e *Engine) CancelOrder(ctx context.Context, tradeID string) error {
 	if trade == nil || trade.Status != "pending" {
 		return fmt.Errorf("order not pending")
 	}
+	if trade.IsLive {
+		return e.cancelLiveOrder(ctx, trade)
+	}
 	return e.trades.Cancel(ctx, tradeID)
 }
 

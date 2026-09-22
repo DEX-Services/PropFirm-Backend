@@ -19,14 +19,13 @@ import (
 	"github.com/dex/propfirm-backend/internal/models"
 )
 
-// Live trading is deliberately scoped to MARKET orders only for this pass —
-// both FUTURES and SPOT are supported, but never limit/stop-loss/
-// take-profit: a real, funded account has no attached-order UI in this
-// release, and a request for one is rejected with a clear error rather than
-// silently falling back to a simulated fill (which would be trading a
-// funded account's real capital on a fake price). Every live order, SPOT or
-// FUTURES, is placed on the shared master account (internal/liveengine),
-// never an account of the trader's own — see that package's doc comment.
+// Live trading supports MARKET and LIMIT orders — both FUTURES and SPOT —
+// but never stop-loss/take-profit: a real, funded account has no attached-
+// order UI in this release, and a request for one is rejected with a clear
+// error rather than silently falling back to a simulated fill (which would
+// be trading a funded account's real capital on a fake price). Every live
+// order, SPOT or FUTURES, market or limit, is placed on the shared master
+// account (internal/liveengine), never an account of the trader's own.
 func (e *Engine) openLivePosition(ctx context.Context, account *models.Account, in OpenPositionInput) (*models.Trade, error) {
 	if e.live == nil || !e.live.Enabled() {
 		return nil, fmt.Errorf("live trading is not available right now")
@@ -34,13 +33,22 @@ func (e *Engine) openLivePosition(ctx context.Context, account *models.Account, 
 	if in.Market != models.MarketFutures && in.Market != models.MarketSpot {
 		return nil, fmt.Errorf("unknown market %q", in.Market)
 	}
-	if in.OrderType != "market" {
-		return nil, fmt.Errorf("live accounts can only place market orders in this release")
-	}
 	if in.Market == models.MarketSpot {
 		in.Leverage = 1 // spot is always cash, never leveraged — same rule as simengine's simulated path
 	}
+	switch in.OrderType {
+	case "market":
+		return e.openLiveMarketOrder(ctx, account, in)
+	case "limit":
+		return e.openLiveLimitOrder(ctx, account, in)
+	default:
+		return nil, fmt.Errorf("live accounts can only place market or limit orders in this release")
+	}
+}
 
+// openLiveMarketOrder places a real MARKET order and records its actual
+// fill immediately — see openLivePosition's doc comment for scope.
+func (e *Engine) openLiveMarketOrder(ctx context.Context, account *models.Account, in OpenPositionInput) (*models.Trade, error) {
 	side := "BUY"
 	if in.Side == models.SideShort {
 		side = "SELL"
@@ -104,6 +112,97 @@ func (e *Engine) openLivePosition(ctx context.Context, account *models.Account, 
 		}
 	}
 
+	trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, filledSize, price, in.Leverage, in.OrderType, nil, "open", "0", true, &result.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, filledSize, err)
+	}
+	return trade, nil
+}
+
+// openLiveLimitOrder places a real LIMIT order on the master account. A
+// real limit order can fill immediately (it crosses the resting book on
+// arrival), fill partially, or simply rest unfilled — unlike a market
+// order, "no immediate fill" is the NORMAL case here, not a failure, so
+// this records a "pending" pf_trades row (entry_price="0", trigger_price
+// set to the limit price, entry_order_id set to the real order) whenever
+// anything remains unfilled, exactly mirroring how the simulated engine's
+// own limit orders start pending and get filled later by the tick loop —
+// reconcileLivePendingOrders (called from liveTick) is that same "later"
+// for the live path, polling the real order's real status instead of
+// checking a price feed against a stored trigger.
+//
+// If the order fills COMPLETELY on arrival, there is nothing left to poll:
+// it's recorded as "open" immediately, identical in shape to a market
+// order's result, since from this point on there is no meaningful
+// difference between "a market order that filled" and "a limit order that
+// happened to fill instantly."
+func (e *Engine) openLiveLimitOrder(ctx context.Context, account *models.Account, in OpenPositionInput) (*models.Trade, error) {
+	if in.TriggerPrice == nil {
+		return nil, fmt.Errorf("limit order requires a trigger price")
+	}
+	side := "BUY"
+	if in.Side == models.SideShort {
+		side = "SELL"
+	}
+	order := liveengine.Order{
+		Symbol: in.Symbol,
+		Market: string(in.Market),
+		Side:   side,
+		Type:   "LIMIT",
+		Price:  in.TriggerPrice.String(),
+		Qty:    in.Size.String(),
+	}
+	if in.Market == models.MarketFutures {
+		leverage := in.Leverage
+		order.Leverage = &leverage
+	}
+	result, err := e.live.SubmitOrder(ctx, order)
+	if err != nil {
+		return nil, fmt.Errorf("live order rejected: %w", err)
+	}
+	if result.Status == "REJECTED" {
+		return nil, fmt.Errorf("live limit order rejected by the real engine (order %s)", result.OrderID)
+	}
+
+	filled, err := decimal.NewFromString(result.Filled)
+	if err != nil {
+		return nil, fmt.Errorf("live order (order %s): could not parse fill amount %q", result.OrderID, result.Filled)
+	}
+	requestedQty := in.Size
+
+	if filled.LessThan(requestedQty) {
+		// Still resting (fully or partially unfilled) — record as pending,
+		// same as the simulated engine's own limit-order path. If it
+		// PARTIALLY filled on arrival, the filled portion is real trading
+		// capital already at risk — but with no fixed entry price to record
+		// for a position that isn't fully formed yet, and no simple way to
+		// split "already open" from "still pending" within one pf_trades
+		// row, this is intentionally left for reconcileLivePendingOrders to
+		// resolve on the very next tick (typically seconds away): it reads
+		// the order's true state fresh from the real engine and opens the
+		// trade at the correct real average fill price once fully settled
+		// enough to record, exactly like a market order's own price lookup.
+		trigger := in.TriggerPrice.String()
+		trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, requestedQty.String(), "0", in.Leverage, in.OrderType, &trigger, "pending", "0", true, &result.OrderID)
+		if err != nil {
+			return nil, fmt.Errorf("live limit order placed on the real engine (order %s) but could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, err)
+		}
+		return trade, nil
+	}
+
+	// Filled completely on arrival — treat exactly like a market order's
+	// own fill: real notional/PnL bookkeeping is identical from here on,
+	// the only difference was the order type submitted to the real engine.
+	filledSize := filled.String()
+	price, err := e.prices.Price(in.Symbol, string(in.Market))
+	if err != nil || price == "" || price == "0" {
+		return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but no price could be recorded — contact support immediately, this must be reconciled manually", result.OrderID, filledSize)
+	}
+	if in.Market == models.MarketSpot {
+		if err := chargeSpotNotional(ctx, e.accounts, account.ID, in.Market, price, filled); err != nil {
+			return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but the real cash cost could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, filledSize, err)
+		}
+	}
 	trade, err := e.trades.Open(ctx, e.newID(), in.AccountID, in.Symbol, in.Market, in.Side, filledSize, price, in.Leverage, in.OrderType, nil, "open", "0", true, &result.OrderID)
 	if err != nil {
 		return nil, fmt.Errorf("order filled on the real engine (order %s, qty %s) but could not be recorded — contact support immediately, this must be reconciled manually: %w", result.OrderID, filledSize, err)
@@ -373,6 +472,10 @@ func (e *Engine) forceCloseLiveOnBreach(ctx context.Context, accountID string) e
 func (e *Engine) liveTick(ctx context.Context, account *models.Account) (TickResult, error) {
 	var result TickResult
 
+	if err := e.reconcileLivePendingOrders(ctx, account.ID); err != nil {
+		return result, fmt.Errorf("reconcile pending live orders: %w", err)
+	}
+
 	balance, err := decimal.NewFromString(account.BalanceBI2XUSD)
 	if err != nil {
 		return result, err
@@ -501,4 +604,129 @@ func (e *Engine) liveEquityContribution(ctx context.Context, accountID string) (
 		total = total.Add(pnl)
 	}
 	return total, nil
+}
+
+// reconcileLivePendingOrders checks every one of accountID's still-pending
+// LIVE limit orders against their real state on the matching engine and
+// brings pf_trades back in step: filled (fully or the terminal partial
+// amount) -> FillLive with the REAL average fill price/quantity; cancelled
+// or rejected on the real engine (e.g. an admin/liquidation-triggered
+// cancel, or the trader's own cancelLiveOrder call landing between ticks)
+// -> Cancel. A live limit order resting untouched is left alone — checked
+// again next tick.
+//
+// Called from liveTick, so this runs on both the 5s scheduler AND
+// internal/liverisk's event-driven path (which calls Tick() the instant a
+// real trade happens on a symbol — exactly the moment a resting limit
+// order on that symbol is most likely to have just filled).
+func (e *Engine) reconcileLivePendingOrders(ctx context.Context, accountID string) error {
+	pending, err := e.trades.PendingOrdersFor(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil // skip the real /orders round-trip entirely when there's nothing to reconcile
+	}
+
+	openOrders, err := e.live.OpenOrders(ctx)
+	if err != nil {
+		return fmt.Errorf("list open orders: %w", err)
+	}
+	stillOpen := make(map[string]liveengine.OpenOrder, len(openOrders))
+	for _, o := range openOrders {
+		stillOpen[o.ID] = o
+	}
+
+	for _, t := range pending {
+		if !t.IsLive || t.EntryOrderID == nil {
+			continue // a stray simulated pending order should never exist on a funded account, but never touch one if it does
+		}
+		orderID := *t.EntryOrderID
+
+		if live, ok := stillOpen[orderID]; ok {
+			// Still resting on the real book. A partial fill while still
+			// resting is real progress but not yet a terminal outcome —
+			// left as-is (still "pending") until the order either fills
+			// completely or leaves the book some other way; there is no
+			// safe way to split "some of this trade is open, the rest is
+			// still an order" within a single pf_trades row, so this
+			// mirrors the same choice already made in openLiveLimitOrder
+			// for a same-request partial fill.
+			_ = live
+			continue
+		}
+
+		// No longer resting: reached a terminal state. Look up what
+		// actually happened.
+		hist, err := e.live.FindOrderInHistory(ctx, t.Symbol, string(t.Market), orderID)
+		if err != nil {
+			return fmt.Errorf("find order %s in history: %w", orderID, err)
+		}
+		if hist == nil {
+			// Not resting AND not yet in history — a brief window right
+			// after a fill/cancel before the history writer catches up.
+			// Leave it pending; the next tick (seconds away) will find it.
+			continue
+		}
+
+		filled, err := decimal.NewFromString(hist.Filled)
+		if err != nil {
+			return fmt.Errorf("parse filled quantity for order %s: %w", orderID, err)
+		}
+		if !filled.IsPositive() {
+			// Cancelled or rejected with nothing filled — the real order
+			// never became a real position; the pending row is simply
+			// dropped, same as a trader-cancelled simulated limit order.
+			if err := e.trades.Cancel(ctx, t.ID); err != nil {
+				return fmt.Errorf("cancel trade %s: %w", t.ID, err)
+			}
+			continue
+		}
+
+		avgPrice := hist.AvgFillPrice
+		if avgPrice == "" || avgPrice == "0" {
+			// Filled quantity is positive but no usable price was recorded
+			// — should not happen for a real fill, but recording a
+			// fabricated price is worse than waiting; retry next tick.
+			continue
+		}
+
+		if t.Market == models.MarketSpot {
+			if err := chargeSpotNotional(ctx, e.accounts, t.AccountID, t.Market, avgPrice, filled); err != nil {
+				return fmt.Errorf("charge spot notional for order %s: %w", orderID, err)
+			}
+		}
+		if err := e.trades.FillLive(ctx, t.ID, avgPrice, filled.String()); err != nil {
+			return fmt.Errorf("fill live trade %s: %w", t.ID, err)
+		}
+	}
+	return nil
+}
+
+// cancelLiveOrder cancels a funded trader's still-pending real limit order
+// — the real-money equivalent of simengine.CancelOrder for a live trade.
+// Cancelling on the real engine first, then marking the row cancelled only
+// if that succeeds, means a failed real cancel never falsely tells the
+// trader their resting order is gone when it might still fill.
+func (e *Engine) cancelLiveOrder(ctx context.Context, trade *models.Trade) error {
+	if e.live == nil || !e.live.Enabled() {
+		return fmt.Errorf("live trading is not available right now")
+	}
+	if trade.EntryOrderID == nil {
+		return fmt.Errorf("live order has no real order id on file — contact support, this must be reconciled manually")
+	}
+	result, err := e.live.CancelOrder(ctx, trade.Symbol, string(trade.Market), *trade.EntryOrderID)
+	if err != nil {
+		return fmt.Errorf("live cancel rejected: %w", err)
+	}
+	// A cancel that arrives after the order already filled is a real,
+	// unremarkable race (matching-engine will simply report it as no
+	// longer cancellable) — reconcileLivePendingOrders will pick up the
+	// real fill on the very next tick regardless, so this is not treated as
+	// an error here; it's surfaced to the trader as "already filled" by
+	// their next positions refresh, not as a cancel failure.
+	if result.Status == "FILLED" {
+		return fmt.Errorf("order already filled on the real engine before it could be cancelled — check your open positions")
+	}
+	return e.trades.Cancel(ctx, trade.ID)
 }
