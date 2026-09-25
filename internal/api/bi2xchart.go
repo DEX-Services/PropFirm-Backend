@@ -12,7 +12,7 @@ import (
 
 // BI2X chart datafeed proxy — a straight port of Dex-Backend's
 // internal/api/bi2xchart.go. The BI2X data feed
-// (https://bitdx-feed-jk3y.onrender.com) exposes a TradingView
+// (https://bitdx-feed-ez3b.onrender.com) exposes a TradingView
 // UDF-compatible datafeed at /api/datafeed/* but sends no
 // Access-Control-Allow-Origin header at all, so browser requests to it
 // directly are CORS-blocked. This backend forwards /bi2x-chart/* to the
@@ -35,7 +35,7 @@ const (
 	// bi2xFeedBaseURL is the real feed server this proxies to. Same fixed
 	// upstream as the exchange's own proxy — not env-configurable for the
 	// same reason: specific to one third-party dependency for one asset.
-	bi2xFeedBaseURL = "https://bitdx-feed-jk3y.onrender.com"
+	bi2xFeedBaseURL = "https://bitdx-feed-ez3b.onrender.com"
 
 	// bi2xProxyPrefix is the path prefix this backend exposes to the
 	// frontend; everything after it is forwarded verbatim (path + query) to
